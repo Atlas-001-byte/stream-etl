@@ -10,7 +10,7 @@ A configuration is a YAML mapping with two keys::
         transforms:           # optional, source-level; run after the
           - op: ...           # shared top-level transforms
     transforms:
-      - op: rename | drop | set | cast
+      - op: rename | drop | set | cast | filter
         ...
 
 Only these keys are recognised; anything else is a ConfigurationError so a
@@ -25,8 +25,10 @@ from . import yaml_lite
 from .errors import ConfigurationError
 
 CAST_TYPES = ("string", "integer", "number", "boolean")
+FILTER_COMPARES = ("eq", "ne", "lt", "lte", "gt", "gte")
+FILTER_ORDERING_COMPARES = ("lt", "lte", "gt", "gte")
 SUPPORTED_SOURCE_TYPES = ("jsonl", "csv")
-TRANSFORM_OPS = ("rename", "drop", "set", "cast")
+TRANSFORM_OPS = ("rename", "drop", "set", "cast", "filter")
 TOP_LEVEL_KEYS = ("sources", "transforms")
 SOURCE_REQUIRED_KEYS = ("id", "type", "path", "batch_size")
 SOURCE_KEYS = SOURCE_REQUIRED_KEYS + ("transforms",)
@@ -47,6 +49,13 @@ def split_path(path):
 def _require_mapping(value, what):
     if not isinstance(value, dict):
         raise ConfigurationError("%s must be a mapping" % what)
+
+
+def _is_finite_number(value):
+    """A non-boolean int/float that is neither NaN nor infinite."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return value == value and value not in (float("inf"), float("-inf"))
 
 
 def _validate_transform(raw, index, prefix="transforms"):
@@ -91,6 +100,29 @@ def _validate_transform(raw, index, prefix="transforms"):
                 raise ConfigurationError(
                     "%s (set) value must be a scalar" % where
                 )
+    elif op == "filter":
+        allowed.update({"field": None, "compare": None, "value": None})
+        for key in ("field", "compare", "value"):
+            if key not in raw:
+                raise ConfigurationError(
+                    "%s (filter) requires %r" % (where, key))
+        split_path(raw["field"])
+        compare = raw["compare"]
+        if compare not in FILTER_COMPARES:
+            raise ConfigurationError(
+                "%s (filter) accepts only %s, got %r"
+                % (where, ", ".join(FILTER_COMPARES), compare)
+            )
+        value = raw["value"]
+        if isinstance(value, (dict, list)):
+            raise ConfigurationError(
+                "%s (filter) value must be a scalar" % where
+            )
+        if compare in FILTER_ORDERING_COMPARES and not _is_finite_number(value):
+            raise ConfigurationError(
+                "%s (filter) value for %r must be a finite number"
+                % (where, compare)
+            )
     extra = set(raw) - set(allowed)
     if extra:
         raise ConfigurationError(

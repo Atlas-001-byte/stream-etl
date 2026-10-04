@@ -55,6 +55,10 @@ transforms:                # 可省略；按序执行，对全部 source 生效
   - op: cast
     field: total
     type: number          # string | integer | number | boolean
+  - op: filter
+    field: total
+    compare: gte          # eq | ne | lt | lte | gt | gte
+    value: 0
 ```
 
 `type` 取 `jsonl` 或 `csv`，两者可在 `sources` 中混用并按配置顺序处理；
@@ -63,8 +67,8 @@ transforms:                # 可省略；按序执行，对全部 source 生效
 
 每个 source 可省略 `transforms`（行为与之前一致）；配置后先执行顶层公共
 转换，再按自身顺序执行该来源的转换。来源级转换的元素与公共转换相同
-（`rename` / `drop` / `set` / `cast`），校验规则、错误类型与数据语义完全
-一致；两者都进入配置指纹，任一变化都会使旧检查点不可恢复。
+（`rename` / `drop` / `set` / `cast` / `filter`），校验规则、错误类型与
+数据语义完全一致；两者都进入配置指纹，任一变化都会使旧检查点不可恢复。
 
 字段路径为点分路径（如 `a.b.c`），支持嵌套 payload：
 
@@ -72,7 +76,20 @@ transforms:                # 可省略；按序执行，对全部 source 生效
 - `drop`、`cast`：路径必须存在；
 - `set`：父路径必须存在（可新建叶子字段）；
 - `cast` 仅接受 `string`、`integer`、`number`、`boolean`，转换失败即
-  数据校验错误，当前批次不提交。
+  数据校验错误，当前批次不提交；
+- `filter`：路径必须存在且字段值必须是标量；条件成立时保留记录，不成立
+  时该输入记录不产生任何输出（但仍计入已消费输入与 `batch_size`）。
+
+`filter` 的 `compare` 仅接受 `eq`、`ne`、`lt`、`lte`、`gt`、`gte`：
+
+- `eq` / `ne` 按 JSON 标量语义比较：`null` 只等于 `null`，字符串按内容
+  精确比较，布尔只与布尔相等，整数与浮点按数值相等判断（布尔不作为
+  数值）；类型不匹配的标量一律不相等。
+- `lt` / `lte` / `gt` / `gte` 只比较有限的非布尔数值；字段值不是有限
+  数值（字符串、布尔、null、非有限浮点）即数据校验错误。
+- 配置中 `filter` 缺少 `field` / `compare` / `value`、`compare` 非法、
+  `value` 不是标量，或排序比较的 `value` 不是有限数值，都是
+  `ConfigurationError`（退出码 2）。
 
 转换不得静默丢字段：任何路径缺失或覆盖已有字段都会报错。
 
@@ -91,9 +108,11 @@ transforms:                # 可省略；按序执行，对全部 source 生效
 ```
 
 - 按配置中 source 的顺序处理；`source_id` 必须与所属 source 的 id 一致。
-- 每条输入恰好输出一次。
-- 同一 source 的 `data` 发生字段新增、字段删除或 cast 类型改变时，
-  `schema_version` 单调递增；值变化本身不产生新版本。旧记录不回写。
+- 每条输入恰好输出一次；被 `filter` 过滤的输入记录不输出，但仍计入
+  `batch_size` 与检查点进度，重复 replay 不会重复或跳过。
+- 同一 source 实际输出的 `data` 发生字段新增、字段删除或 cast 类型改变
+  时，`schema_version` 单调递增；值变化本身不产生新版本，被过滤的记录
+  也不制造版本变化。旧记录不回写。
 - 每 `batch_size` 条以及每个 source 结束时刷盘并原子替换检查点。
 
 ### CSV 源
@@ -134,8 +153,8 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
 
 | 类型 | 退出码 | 触发场景 |
 | --- | --- | --- |
-| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径 |
-| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败 |
+| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径、filter 配置非法 |
+| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败、filter 字段缺失或类型不适用于比较 |
 | `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、已提交前缀改变或输入变短 |
 | `SourceError` | 5 | 输入不可读 |
 | `SinkError` | 5 | 输出或检查点不可写 |

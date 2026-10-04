@@ -11,7 +11,8 @@ Two source types are supported:
 
 For every input record the configured transforms are applied to the payload
 in order (shared transforms first, then the source's own), and one output
-object is emitted::
+object is emitted — unless a ``filter`` transform rejects the record, in
+which case it produces no output (but still counts as consumed input)::
 
     {"source_id": ..., "event_id": ..., "schema_version": N, "data": {...}}
 
@@ -167,12 +168,65 @@ def _cast_value(value, target, where):
 
 
 # --------------------------------------------------------------------------
+# Filters
+# --------------------------------------------------------------------------
+
+
+def _scalar_equal(left, right):
+    """JSON scalar equality: null only equals null, booleans only booleans,
+    numbers compare numerically across int/float, strings by content."""
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) \
+            and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    if isinstance(left, str) and isinstance(right, str):
+        return left == right
+    return False
+
+
+def _is_finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return value == value and value not in (float("inf"), float("-inf"))
+
+
+def _filter_keep(field_value, compare, value, where):
+    """Evaluate one filter predicate; True keeps the record."""
+    if isinstance(field_value, (dict, list)):
+        raise DataValidationError(
+            "%s: filter field must be a scalar" % where)
+    if compare == "eq":
+        return _scalar_equal(field_value, value)
+    if compare == "ne":
+        return not _scalar_equal(field_value, value)
+    # Ordering compares only apply to finite, non-boolean numbers.
+    if not _is_finite_number(field_value):
+        raise DataValidationError(
+            "%s: filter compare %r requires a finite number, got %r"
+            % (where, compare, field_value))
+    if compare == "lt":
+        return field_value < value
+    if compare == "lte":
+        return field_value <= value
+    if compare == "gt":
+        return field_value > value
+    return field_value >= value
+
+
+# --------------------------------------------------------------------------
 # Transforms
 # --------------------------------------------------------------------------
 
 
 def apply_transforms(data, transforms, where):
-    """Apply transforms in order to ``data`` (mutated in place)."""
+    """Apply transforms in order to ``data`` (mutated in place).
+
+    Returns the transformed mapping, or ``None`` when a ``filter``
+    transform rejects the record (the record then produces no output).
+    """
     for raw in transforms:
         op = raw["op"]
         if op == "rename":
@@ -197,6 +251,12 @@ def apply_transforms(data, transforms, where):
             parts = split_path(raw["field"])
             parent, key = _parent_existing(data, parts, where)
             parent[key] = raw["value"]
+        elif op == "filter":
+            parts = split_path(raw["field"])
+            parent, key = _parent_and_key(data, parts, where)
+            if not _filter_keep(parent[key], raw["compare"], raw["value"],
+                                where):
+                return None
         else:  # cast
             parts = split_path(raw["field"])
             parent, key = _parent_and_key(data, parts, where)
@@ -881,15 +941,20 @@ def _emit_record(spec, state, config, sink, source_id, event_id, payload,
     data = apply_transforms(payload, config.transforms, where)
     # Source-level transforms run after the shared ones, in their own
     # configured order.
-    data = apply_transforms(data, spec["transforms"], where)
-    state.note_schema(schema_fingerprint(data))
-    record = {
-        "source_id": source_id,
-        "event_id": event_id,
-        "schema_version": state.schema_version,
-        "data": data,
-    }
-    _write_record(sink, record)
+    if data is not None:
+        data = apply_transforms(data, spec["transforms"], where)
+    if data is not None:
+        state.note_schema(schema_fingerprint(data))
+        record = {
+            "source_id": source_id,
+            "event_id": event_id,
+            "schema_version": state.schema_version,
+            "data": data,
+        }
+        _write_record(sink, record)
+    # Filtered records emit nothing and leave the schema version untouched,
+    # but they are consumed input: the record counter (which positions the
+    # resume point) and the batch counter both include them.
     state.records += 1
 
 
