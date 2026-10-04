@@ -1,18 +1,30 @@
 """The ETL engine: run, replay, transforms, schema evolution, checkpoints.
 
-For every input JSON object the engine reads ``source_id`` / ``event_id`` /
-``payload``, applies the configured transforms to the payload in order, and
-emits one output object::
+Two source types are supported:
+
+* ``jsonl``: each input line is a JSON object carrying ``source_id`` /
+  ``event_id`` / ``payload``;
+* ``csv``: UTF-8 CSV (optional BOM) whose first logical record is a unique,
+  non-empty header containing ``source_id`` and ``event_id``; the remaining
+  columns form a flat string payload and the two control columns stay out of
+  ``data``.
+
+For every input record the configured transforms are applied to the payload
+in order (shared transforms first, then the source's own), and one output
+object is emitted::
 
     {"source_id": ..., "event_id": ..., "schema_version": N, "data": {...}}
 
 Sources are processed in configuration order. Every ``batch_size`` records
-for a source (and at each source boundary) the output is fsynced and the
-checkpoint is atomically replaced. Replay truncates any uncommitted tail of
-the output using the byte offset stored in the checkpoint, then continues, so
-records are never duplicated or skipped.
+(and at each source boundary) the output is fsynced and the checkpoint is
+atomically replaced. The checkpoint stores the byte offset of the last
+committed record boundary together with a hash of the input prefix up to it;
+replay verifies that prefix is unchanged and the file has not shrunk,
+truncates any uncommitted tail of the output using the sink byte offset,
+then continues, so records are never duplicated or skipped.
 """
 
+import hashlib
 import json
 import os
 import tempfile
@@ -25,8 +37,10 @@ from .errors import (
     SourceError,
 )
 
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 ENCODING = "utf-8"
+BOM = b"\xef\xbb\xbf"
+EMPTY_PREFIX_HASH = hashlib.sha256(b"").hexdigest()
 
 
 # --------------------------------------------------------------------------
@@ -236,6 +250,7 @@ class SourceState:
     def __init__(self, spec):
         self.spec = spec
         self.offset = 0
+        self.input_hash = EMPTY_PREFIX_HASH
         self.records = 0
         self.schema_version = 0
         self.schema_fingerprint = None
@@ -249,6 +264,7 @@ class SourceState:
         return {
             "path": self.spec["path"],
             "offset": self.offset,
+            "input_hash": self.input_hash,
             "records": self.records,
             "schema_version": self.schema_version,
             "schema_fingerprint": self.schema_fingerprint,
@@ -260,8 +276,8 @@ class SourceState:
         if not isinstance(raw, dict):
             raise CheckpointError("checkpoint entry for source %r is invalid"
                                   % spec["id"])
-        required = ("path", "offset", "records", "schema_version",
-                    "schema_fingerprint")
+        required = ("path", "offset", "input_hash", "records",
+                    "schema_version", "schema_fingerprint")
         for key in required:
             if key not in raw:
                 raise CheckpointError(
@@ -280,6 +296,19 @@ class SourceState:
                     "checkpoint %s for source %r is invalid"
                     % (key, spec["id"])
                 )
+        prefix_hash = raw["input_hash"]
+        if not isinstance(prefix_hash, str) or len(prefix_hash) != 64:
+            raise CheckpointError(
+                "checkpoint input_hash for source %r is invalid"
+                % spec["id"]
+            )
+        try:
+            bytes.fromhex(prefix_hash)
+        except ValueError:
+            raise CheckpointError(
+                "checkpoint input_hash for source %r is invalid"
+                % spec["id"]
+            )
         fp = raw["schema_fingerprint"]
         if fp is not None and not isinstance(fp, str):
             raise CheckpointError(
@@ -287,6 +316,7 @@ class SourceState:
                 % spec["id"]
             )
         state.offset = raw["offset"]
+        state.input_hash = prefix_hash
         state.records = raw["records"]
         state.schema_version = raw["schema_version"]
         state.schema_fingerprint = fp
@@ -495,14 +525,313 @@ def _flush_sink(sink):
         raise SinkError("cannot flush output: %s" % exc)
 
 
-def _count_lines_before(path, offset):
-    if offset == 0:
-        return 0
+# --------------------------------------------------------------------------
+# CSV parsing (RFC 4180 subset: comma delimiters, quoted fields, doubled
+# quotes, LF/CRLF, embedded newlines, optional leading UTF-8 BOM)
+# --------------------------------------------------------------------------
+
+
+_COMMA = 0x2C
+_QUOTE = 0x22
+_CR = 0x0D
+_LF = 0x0A
+
+
+class _CSVParser:
+    """Streaming byte-oriented parser for one CSV file.
+
+    Structural characters never occur inside UTF-8 multi-byte sequences, so
+    the grammar is recognised on raw bytes and individual fields are decoded
+    on demand; this keeps the absolute byte offset of every logical record
+    boundary exact for checkpointing. Only the bytes of the record currently
+    being parsed are buffered.
+    """
+
+    CHUNK = 1 << 16
+
+    def __init__(self, source_id, fp, start=0, expect_header=True,
+                 data_base=0):
+        self.sid = source_id
+        self.fp = fp
+        self.buf = b""
+        self.i = 0
+        # Absolute file offset of the next byte to consume.
+        self.abs = start
+        self.expect_header = expect_header
+        # Data records already present before this parser's first record
+        # (used on resume so error labels use the file-wide record number).
+        self.data_base = data_base
+        # 1-based file-wide number of the current/last data record.
+        self.data_index = data_base
+
+    # -- low-level byte stream -------------------------------------------
+
+    def _fill(self):
+        if self.i >= len(self.buf):
+            self.buf = self.fp.read(self.CHUNK)
+            self.i = 0
+        return self.i < len(self.buf)
+
+    def _peek(self):
+        if not self._fill():
+            return None
+        return self.buf[self.i]
+
+    def _take(self):
+        c = self.buf[self.i]
+        self.i += 1
+        self.abs += 1
+        return c
+
+    # -- error helpers ----------------------------------------------------
+
+    def _label(self, is_data):
+        if is_data:
+            return "source %r record %d" % (self.sid, self.data_index)
+        return "source %r header" % self.sid
+
+    def _fail(self, is_data, detail):
+        raise DataValidationError("%s: %s" % (self._label(is_data), detail))
+
+    def _decode(self, raw, is_data):
+        try:
+            text = raw.decode(ENCODING)
+        except UnicodeDecodeError:
+            self._fail(is_data, "invalid UTF-8")
+        if "﻿" in text:
+            self._fail(is_data, "BOM is only allowed at the start of the file")
+        return text
+
+    # -- parsing ----------------------------------------------------------
+
+    def next_record(self):
+        """Parse one logical record.
+
+        Returns ``(raw_bytes, fields, is_header)`` where ``raw_bytes`` are
+        the exact input bytes of the record (line terminator included, and
+        the leading BOM for a fresh header), or ``None`` at clean EOF.
+        """
+        c = self._peek()
+        if c is None:
+            return None
+        is_header = self.expect_header
+        self.expect_header = False
+        is_data = not is_header
+        if is_data:
+            self.data_index += 1
+        raw = bytearray()
+        if is_header and self.abs == 0:
+            # A BOM is accepted only as the very first bytes of the file; at
+            # this point the first chunk is buffered and nothing is consumed.
+            self._fill()
+            if self.buf[self.i:self.i + len(BOM)] == BOM:
+                for _ in range(len(BOM)):
+                    self._take()
+                raw += BOM
+        fields = []
+        mode = "start"          # start | unquoted | quoted | after
+        field = bytearray()
+        quoted_value = None
+        while True:
+            c = self._peek()
+            if mode == "start":
+                if c is None:
+                    # EOF immediately after a comma: the last field is empty.
+                    fields.append("")
+                    break
+                b = self._take()
+                raw.append(b)
+                if b == _QUOTE:
+                    mode = "quoted"
+                elif b == _COMMA:
+                    fields.append("")
+                elif b == _LF or b == _CR:
+                    if not fields:
+                        self._fail(is_data, "empty logical record")
+                    fields.append("")
+                    self._finish_terminator(b, is_data, raw)
+                    break
+                else:
+                    field.append(b)
+                    mode = "unquoted"
+            elif mode == "unquoted":
+                if c is None:
+                    fields.append(self._decode(bytes(field), is_data))
+                    break
+                b = self._take()
+                raw.append(b)
+                if b == _QUOTE:
+                    self._fail(is_data, "unexpected quote in unquoted field")
+                if b == _COMMA:
+                    fields.append(self._decode(bytes(field), is_data))
+                    field = bytearray()
+                    mode = "start"
+                elif b == _LF or b == _CR:
+                    fields.append(self._decode(bytes(field), is_data))
+                    self._finish_terminator(b, is_data, raw)
+                    break
+                else:
+                    field.append(b)
+            elif mode == "quoted":
+                if c is None:
+                    self._fail(is_data, "unterminated quoted field")
+                b = self._take()
+                raw.append(b)
+                if b == _QUOTE:
+                    if self._peek() == _QUOTE:
+                        # Escaped quote: keep both bytes; collapse on decode.
+                        field.append(b)
+                        field.append(self._take())
+                        raw.append(_QUOTE)
+                    else:
+                        quoted_value = self._decode(
+                            bytes(field).replace(b'""', b'"'), is_data)
+                        mode = "after"
+                else:
+                    field.append(b)
+            else:  # directly after a closing quote
+                if c is None:
+                    fields.append(quoted_value)
+                    break
+                b = self._take()
+                raw.append(b)
+                if b == _COMMA:
+                    fields.append(quoted_value)
+                    field = bytearray()
+                    mode = "start"
+                elif b == _LF or b == _CR:
+                    fields.append(quoted_value)
+                    self._finish_terminator(b, is_data, raw)
+                    break
+                else:
+                    self._fail(is_data, "unexpected text after quoted field")
+        return bytes(raw), fields, is_header
+
+    def _finish_terminator(self, first, is_data, raw):
+        if first == _CR:
+            nxt = self._peek()
+            if nxt != _LF:
+                self._fail(is_data,
+                           "bare carriage return is not a line terminator")
+            raw.append(self._take())
+
+
+def _open_input(spec):
     try:
-        with open(path, "rb") as fp:
-            return sum(1 for _ in fp.read(offset).splitlines())
+        return open(spec["path"], "rb")
     except OSError as exc:
-        raise SourceError("cannot read %s: %s" % (path, exc))
+        raise SourceError("cannot open input %s: %s" % (spec["path"], exc))
+
+
+def _verify_committed_prefix(spec, state):
+    """Verify the committed input prefix, then position at its boundary.
+
+    Re-hashes the raw input bytes ``[0:state.offset]`` and compares them
+    against the checkpointed hash, also rejecting a file that has shrunk
+    below the committed boundary. Returns ``(fp, hasher)`` with ``fp``
+    positioned at the resume offset and ``hasher`` already covering the
+    committed prefix, so later updates extend it to the new prefix.
+    """
+    fp = _open_input(spec)
+    target = state.offset
+    hasher = hashlib.sha256()
+    try:
+        size = os.fstat(fp.fileno()).st_size
+        if target > size:
+            raise CheckpointError(
+                "input %s is shorter than the committed offset; "
+                "cannot recover" % spec["path"]
+            )
+        remaining = target
+        while remaining > 0:
+            try:
+                chunk = fp.read(min(1 << 16, remaining))
+            except OSError as exc:
+                raise SourceError(
+                    "cannot read %s: %s" % (spec["path"], exc))
+            if not chunk:
+                break
+            hasher.update(chunk)
+            remaining -= len(chunk)
+        if remaining != 0 or hasher.hexdigest() != state.input_hash:
+            raise CheckpointError(
+                "committed input prefix for source %r has changed; "
+                "cannot recover" % spec["id"]
+            )
+        try:
+            fp.seek(target)
+        except OSError as exc:
+            raise SourceError("cannot read %s: %s" % (spec["path"], exc))
+    except CheckpointError:
+        fp.close()
+        raise
+    return fp, hasher
+
+
+def _validate_csv_header(source_id, fields):
+    """Validate a CSV header and return the full, ordered column list.
+
+    Column names must be unique and non-empty and include both control
+    columns ``source_id`` and ``event_id``.
+    """
+    if not fields:
+        raise DataValidationError("source %r header: empty header" % source_id)
+    seen = set()
+    for name in fields:
+        if name == "":
+            raise DataValidationError(
+                "source %r header: empty column name" % source_id)
+        if name in seen:
+            raise DataValidationError(
+                "source %r header: duplicate column %r" % (source_id, name))
+        seen.add(name)
+    for required in ("source_id", "event_id"):
+        if required not in seen:
+            raise DataValidationError(
+                "source %r header: missing required column %r"
+                % (source_id, required))
+    return list(fields)
+
+
+def _read_csv_header(spec):
+    """Read and validate just the header (used when resuming a CSV source)."""
+    fp = _open_input(spec)
+    try:
+        parser = _CSVParser(spec["id"], fp, start=0, expect_header=True)
+        result = parser.next_record()
+        if result is None:
+            raise DataValidationError(
+                "source %r: header is missing" % spec["id"])
+        _raw, fields, _is_header = result
+        return _validate_csv_header(spec["id"], fields)
+    finally:
+        fp.close()
+
+
+def _csv_payload(spec, columns, fields, record_index):
+    """Split one CSV data record into control values and the flat payload."""
+    where = "source %r record %d" % (spec["id"], record_index)
+    if len(fields) != len(columns):
+        raise DataValidationError(
+            "%s: expected %d columns, got %d"
+            % (where, len(columns), len(fields)))
+    sid_index = columns.index("source_id")
+    eid_index = columns.index("event_id")
+    source_id = fields[sid_index]
+    event_id = fields[eid_index]
+    if source_id != spec["id"]:
+        raise DataValidationError(
+            "%s: source_id %r does not match configured source"
+            % (where, source_id))
+    if event_id == "":
+        raise DataValidationError(
+            "%s: event_id must be a non-empty string" % where)
+    payload = {
+        columns[j]: fields[j]
+        for j in range(len(columns))
+        if j != sid_index and j != eid_index
+    }
+    return source_id, event_id, payload
 
 
 def _process(config, states, sink, checkpoint_path):
@@ -516,79 +845,136 @@ def _process(config, states, sink, checkpoint_path):
 
     counts = {}
     for spec, state in zip(config.sources, states):
-        emitted = 0
+        records_before = state.records
+        resuming = state.offset > 0
+        if resuming:
+            fp, hasher = _verify_committed_prefix(spec, state)
+        else:
+            fp = _open_input(spec)
+            hasher = hashlib.sha256()
         try:
-            fp = open(spec["path"], "rb")
-        except OSError as exc:
-            raise SourceError("cannot open input %s: %s" % (spec["path"], exc))
-        try:
-            size = os.fstat(fp.fileno()).st_size
-            if state.offset > size:
-                raise CheckpointError(
-                    "input %s is shorter than the committed offset; "
-                    "cannot recover" % spec["path"]
-                )
-            fp.seek(state.offset)
-            line_number = _count_lines_before(spec["path"], state.offset)
-            while True:
-                try:
-                    raw_line = fp.readline()
-                except OSError as exc:
-                    raise SourceError("cannot read %s: %s" % (spec["path"], exc))
-                if not raw_line:
-                    break
-                state.offset += len(raw_line)
-                line_number += 1
-                try:
-                    text = raw_line.decode(ENCODING)
-                except UnicodeDecodeError:
-                    raise DataValidationError(
-                        "source %r line %d: malformed JSON"
-                        % (spec["id"], line_number)
-                    )
-                # Every line of a jsonl source is a JSON object; blank or
-                # whitespace-only lines are records that fail validation.
-                where = "source %r line %d" % (spec["id"], line_number)
-                try:
-                    obj = json.loads(text)
-                except json.JSONDecodeError:
-                    raise DataValidationError("%s: malformed JSON" % where)
-                source_id, event_id, payload = _extract_envelope(
-                    obj, spec["id"], line_number
-                )
-                if source_id != spec["id"]:
-                    raise DataValidationError(
-                        "%s: source_id %r does not match configured source"
-                        % (where, source_id)
-                    )
-                data = apply_transforms(payload, config.transforms, where)
-                # Source-level transforms run after the shared ones, in
-                # their own configured order.
-                data = apply_transforms(data, spec["transforms"], where)
-                state.note_schema(schema_fingerprint(data))
-                record = {
-                    "source_id": source_id,
-                    "event_id": event_id,
-                    "schema_version": state.schema_version,
-                    "data": data,
-                }
-                _write_record(sink, record)
-                state.records += 1
-                emitted += 1
-                pending += 1
-                if pending >= spec["batch_size"]:
-                    commit()
-                    pending = 0
+            if spec["type"] == "jsonl":
+                pending = _process_jsonl(
+                    spec, state, config, sink, commit, pending, fp, hasher)
+            else:
+                pending = _process_csv(
+                    spec, state, config, sink, commit, pending, fp, hasher,
+                    resuming)
         finally:
             fp.close()
-        if pending > 0:
-            commit()
-            pending = 0
-        counts[spec["id"]] = emitted
+        counts[spec["id"]] = state.records - records_before
     # A successful invocation always leaves a checkpoint on disk, even when
     # there was nothing new to append.
     commit()
     return counts
+
+
+def _commit_boundary(state, boundary, hasher, commit):
+    """Advance the durable input boundary and atomically commit."""
+    state.offset = boundary
+    state.input_hash = hasher.hexdigest()
+    commit()
+
+
+def _emit_record(spec, state, config, sink, source_id, event_id, payload,
+                 where):
+    data = apply_transforms(payload, config.transforms, where)
+    # Source-level transforms run after the shared ones, in their own
+    # configured order.
+    data = apply_transforms(data, spec["transforms"], where)
+    state.note_schema(schema_fingerprint(data))
+    record = {
+        "source_id": source_id,
+        "event_id": event_id,
+        "schema_version": state.schema_version,
+        "data": data,
+    }
+    _write_record(sink, record)
+    state.records += 1
+
+
+def _process_jsonl(spec, state, config, sink, commit, pending, fp, hasher):
+    boundary = state.offset
+    # Every committed jsonl line produced exactly one record.
+    line_number = state.records
+    while True:
+        try:
+            raw_line = fp.readline()
+        except OSError as exc:
+            raise SourceError("cannot read %s: %s" % (spec["path"], exc))
+        if not raw_line:
+            break
+        line_number += 1
+        boundary += len(raw_line)
+        hasher.update(raw_line)
+        # Every line of a jsonl source is a JSON object; blank or
+        # whitespace-only lines are records that fail validation.
+        where = "source %r line %d" % (spec["id"], line_number)
+        try:
+            text = raw_line.decode(ENCODING)
+        except UnicodeDecodeError:
+            raise DataValidationError("%s: malformed JSON" % where)
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            raise DataValidationError("%s: malformed JSON" % where)
+        source_id, event_id, payload = _extract_envelope(
+            obj, spec["id"], line_number)
+        if source_id != spec["id"]:
+            raise DataValidationError(
+                "%s: source_id %r does not match configured source"
+                % (where, source_id))
+        _emit_record(
+            spec, state, config, sink, source_id, event_id, payload, where)
+        pending += 1
+        if pending >= spec["batch_size"]:
+            _commit_boundary(state, boundary, hasher, commit)
+            pending = 0
+    if pending > 0:
+        _commit_boundary(state, boundary, hasher, commit)
+        pending = 0
+    return pending
+
+
+def _process_csv(spec, state, config, sink, commit, pending, fp, hasher,
+                 resuming):
+    if resuming:
+        columns = _read_csv_header(spec)
+        parser = _CSVParser(
+            spec["id"], fp, start=state.offset, expect_header=False,
+            data_base=state.records)
+    else:
+        parser = _CSVParser(spec["id"], fp, start=0, expect_header=True)
+        result = parser.next_record()
+        if result is None:
+            raise DataValidationError(
+                "source %r: header is missing" % spec["id"])
+        raw_header, fields, _is_header = result
+        columns = _validate_csv_header(spec["id"], fields)
+        # The header is part of the source's committed input prefix; make
+        # its boundary durable immediately so even a header-only file
+        # resumes correctly.
+        hasher.update(raw_header)
+        _commit_boundary(state, parser.abs, hasher, commit)
+    while True:
+        result = parser.next_record()
+        if result is None:
+            break
+        raw_record, fields, _is_header = result
+        hasher.update(raw_record)
+        source_id, event_id, payload = _csv_payload(
+            spec, columns, fields, parser.data_index)
+        where = "source %r record %d" % (spec["id"], parser.data_index)
+        _emit_record(
+            spec, state, config, sink, source_id, event_id, payload, where)
+        pending += 1
+        if pending >= spec["batch_size"]:
+            _commit_boundary(state, parser.abs, hasher, commit)
+            pending = 0
+    if pending > 0:
+        _commit_boundary(state, parser.abs, hasher, commit)
+        pending = 0
+    return pending
 
 
 # --------------------------------------------------------------------------

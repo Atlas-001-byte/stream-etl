@@ -36,7 +36,7 @@ bin/stream-etl replay --config config.yaml --output out.jsonl --checkpoint cp.js
 ```yaml
 sources:
   - id: orders            # 唯一非空 id
-    type: jsonl           # 目前仅支持逐行 JSON 对象的 jsonl
+    type: jsonl           # jsonl（逐行 JSON 对象）或 csv
     path: data/orders.jsonl
     batch_size: 100       # 正整数，每处理这么多条提交一次检查点
     transforms:            # 可省略；来源级转换，在公共 transforms 之后按序执行
@@ -56,6 +56,10 @@ transforms:                # 可省略；按序执行，对全部 source 生效
     field: total
     type: number          # string | integer | number | boolean
 ```
+
+`type` 取 `jsonl` 或 `csv`，两者可在 `sources` 中混用并按配置顺序处理；
+`id`、`path`、`batch_size`、`transforms` 的含义对两种类型完全一致，CSV
+源不引入额外配置键。
 
 每个 source 可省略 `transforms`（行为与之前一致）；配置后先执行顶层公共
 转换，再按自身顺序执行该来源的转换。来源级转换的元素与公共转换相同
@@ -92,15 +96,47 @@ transforms:                # 可省略；按序执行，对全部 source 生效
   `schema_version` 单调递增；值变化本身不产生新版本。旧记录不回写。
 - 每 `batch_size` 条以及每个 source 结束时刷盘并原子替换检查点。
 
+### CSV 源
+
+`type: csv` 的输入为 UTF-8（可带仅位于文件开头的 BOM），按 RFC 4180
+常见子集解析：逗号分隔、双引号包裹字段、`""` 转义双引号；接受 LF 与
+CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行。
+
+- 第一条逻辑记录是表头：列名唯一且非空，必须同时含 `source_id` 与
+  `event_id`；其余列按声明顺序组成扁平的字符串 `data`，两个控制列不
+  进入 `data`，空单元格保留为空字符串。
+- 每条数据记录输出一条与 jsonl 完全相同格式的记录；CSV 的 `event_id`
+  始终是字符串且不能为空，`source_id` 必须等于所属 source 的 id。
+- 公共 `transforms` 先执行，来源转换随后执行；CSV 字段均为字符串，需
+  要数值/布尔语义时用 `cast`。
+- 以下情形都是 `DataValidationError`（退出码 3）：重复或空表头、缺少
+  必需列、空逻辑记录、列数不一致、引号未闭合、BOM 出现在非开头位置、
+  无效 UTF-8。
+- 非法 csv 配置仍为 `ConfigurationError`（退出码 2），输入不可读为
+  `SourceError`，输出/检查点不可写为 `SinkError`（均为退出码 5）。
+
+## 断点与恢复
+
+检查点按逻辑记录边界记录每个 source 的进度：`offset` 为最后已提交记录
+结束处的字节偏移，`input_hash` 为输入字节前缀 `[0:offset]` 的 SHA-256。
+
+- `run` 要求 `--output` 与 `--checkpoint` 均不存在；`replay` 要求两者
+  均存在。
+- replay 先校验每个 source 的已提交输入前缀哈希一致且文件未变短，否则
+  报告 `CheckpointError`（退出码 4）；随后截断 output 中超过已提交偏移
+  的未提交尾部，再从最后已提交批次之后的下一条记录继续，不重复、不跳过。
+- 对 csv 源，进度定位于逻辑记录边界，因此跨物理行的记录也能精确恢复；
+- 无新记录时文件结果确定，可反复 replay。
+
 ## 错误与退出码
 
 错误输出到 stderr，形如 `Error: <类型>: <细节>`：
 
 | 类型 | 退出码 | 触发场景 |
 | --- | --- | --- |
-| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整、未知操作、非法路径 |
-| `DataValidationError` | 3 | 记录缺 `source_id`/`event_id`/`payload`、路径不存在、cast 失败 |
-| `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、无法恢复 |
+| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径 |
+| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败 |
+| `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、已提交前缀改变或输入变短 |
 | `SourceError` | 5 | 输入不可读 |
 | `SinkError` | 5 | 输出或检查点不可写 |
 
