@@ -19,19 +19,31 @@ A ``filter`` transform instead decides whether the record survives: when its
 condition fails the input record is still consumed (it counts toward the
 batch and the committed prefix) but emits no output and no schema change.
 
+A source may configure ``dedup_window: N`` (a positive integer). The source
+then keeps the ``event_id`` values of the last ``N - 1`` *consumed* input
+records in a sliding window. Right after envelope validation and before any
+transform runs, a record whose ``event_id`` matches a windowed key under JSON
+scalar semantics is treated as a duplicate: it is consumed (it counts toward
+the batch and the committed prefix, and slides through the window) but emits
+no output and triggers no schema change. ``N == 1`` keeps an empty window, so
+nothing is ever deduplicated; a source without ``dedup_window`` behaves
+exactly as before. Windows are per source and never interact.
+
 Sources are processed in configuration order. Every ``batch_size`` records
 (and at each source boundary) the output is fsynced and the checkpoint is
 atomically replaced. The checkpoint stores the byte offset of the last
-committed record boundary together with a hash of the input prefix up to it;
-replay verifies that prefix is unchanged and the file has not shrunk,
-truncates any uncommitted tail of the output using the sink byte offset,
-then continues, so records are never duplicated or skipped.
+committed record boundary together with a hash of the input prefix up to it
+and, for dedup sources, the complete sliding window; replay verifies that
+prefix is unchanged and the file has not shrunk, truncates any uncommitted
+tail of the output using the sink byte offset, then continues, so records
+are never duplicated or skipped.
 """
 
 import hashlib
 import json
 import os
 import tempfile
+from collections import deque
 
 from .config import is_finite_number, split_path
 from .errors import (
@@ -42,6 +54,10 @@ from .errors import (
 )
 
 CHECKPOINT_VERSION = 2
+# Version 3 adds the per-source dedup sliding window. It is only used by
+# configurations that set ``dedup_window``; plain configurations keep writing
+# version 2 and old version 2 checkpoints remain replayable against them.
+CHECKPOINT_VERSION_DEDUP = 3
 ENCODING = "utf-8"
 BOM = b"\xef\xbb\xbf"
 EMPTY_PREFIX_HASH = hashlib.sha256(b"").hexdigest()
@@ -318,14 +334,39 @@ class SourceState:
         self.records = 0
         self.schema_version = 0
         self.schema_fingerprint = None
+        # ``dedup_window`` is None for sources without dedup (legacy
+        # behaviour); otherwise the window holds the event_id values of the
+        # last ``dedup_window - 1`` consumed input records.
+        self.dedup_window = spec.get("dedup_window")
+        if self.dedup_window is None:
+            self.window = None
+        else:
+            self.window = deque((), maxlen=self.dedup_window - 1)
 
     def note_schema(self, fp):
         if fp != self.schema_fingerprint:
             self.schema_version += 1
             self.schema_fingerprint = fp
 
+    def note_event(self, event_id):
+        """Register one consumed input record; return True if duplicated.
+
+        The key is compared against the window under JSON scalar semantics;
+        every consumed record (first occurrence, duplicate or filtered-out)
+        slides through the window. With no dedup configured nothing is ever
+        reported as a duplicate; with ``dedup_window == 1`` the window is
+        empty, so the same holds.
+        """
+        if self.window is None:
+            return False
+        duplicate = any(
+            _scalar_equal(event_id, key) for key in self.window
+        )
+        self.window.append(event_id)
+        return duplicate
+
     def to_json(self):
-        return {
+        doc = {
             "path": self.spec["path"],
             "offset": self.offset,
             "input_hash": self.input_hash,
@@ -333,6 +374,10 @@ class SourceState:
             "schema_version": self.schema_version,
             "schema_fingerprint": self.schema_fingerprint,
         }
+        if self.dedup_window is not None:
+            doc["dedup_window"] = self.dedup_window
+            doc["dedup_keys"] = list(self.window)
+        return doc
 
     @classmethod
     def from_json(cls, spec, raw):
@@ -384,7 +429,67 @@ class SourceState:
         state.records = raw["records"]
         state.schema_version = raw["schema_version"]
         state.schema_fingerprint = fp
+        state.window = state._restore_window(spec, raw)
         return state
+
+    def _restore_window(self, spec, raw):
+        """Validate and rebuild the dedup window from checkpoint data."""
+        configured = spec.get("dedup_window")
+        has_window_state = "dedup_window" in raw or "dedup_keys" in raw
+        if configured is None:
+            if has_window_state:
+                raise CheckpointError(
+                    "checkpoint for source %r carries dedup window state "
+                    "but the source configures no dedup_window"
+                    % spec["id"]
+                )
+            return None
+        if "dedup_window" not in raw or "dedup_keys" not in raw:
+            raise CheckpointError(
+                "checkpoint for source %r is missing the dedup window "
+                "state" % spec["id"]
+            )
+        saved_window = raw["dedup_window"]
+        if (isinstance(saved_window, bool)
+                or not isinstance(saved_window, int)
+                or saved_window < 1):
+            raise CheckpointError(
+                "checkpoint dedup_window for source %r is invalid"
+                % spec["id"]
+            )
+        if saved_window != configured:
+            raise CheckpointError(
+                "checkpoint dedup_window for source %r is %d but the "
+                "configuration is %d"
+                % (spec["id"], saved_window, configured)
+            )
+        keys = raw["dedup_keys"]
+        if not isinstance(keys, list):
+            raise CheckpointError(
+                "checkpoint dedup window for source %r is invalid"
+                % spec["id"]
+            )
+        capacity = configured - 1
+        if len(keys) > capacity:
+            raise CheckpointError(
+                "checkpoint dedup window for source %r exceeds its "
+                "configured window" % spec["id"]
+            )
+        # Every consumed record slides through the window, so its size is
+        # exactly the consumed-record count capped at N-1; a mismatch means
+        # the state is corrupt or was produced by a different stream.
+        if len(keys) != min(self.records, capacity):
+            raise CheckpointError(
+                "checkpoint dedup window for source %r is inconsistent "
+                "with its record count" % spec["id"]
+            )
+        for key in keys:
+            if isinstance(key, (dict, list)):
+                raise CheckpointError(
+                    "checkpoint dedup window for source %r contains a "
+                    "non-scalar event_id" % spec["id"]
+                )
+        return deque(keys, maxlen=capacity)
 
 
 class Checkpoint:
@@ -394,8 +499,13 @@ class Checkpoint:
         self.sink_offset = sink_offset
 
     def to_json(self):
+        uses_dedup = any(
+            spec.get("dedup_window") is not None
+            for spec in self.config.sources
+        )
         return {
-            "version": CHECKPOINT_VERSION,
+            "version": CHECKPOINT_VERSION_DEDUP if uses_dedup
+            else CHECKPOINT_VERSION,
             "config_fingerprint": self.config.fingerprint(),
             "sink_offset": self.sink_offset,
             "sources": {
@@ -448,11 +558,27 @@ def load_checkpoint(path, config):
         raise CheckpointError("checkpoint %s is corrupt" % path)
     if not isinstance(doc, dict):
         raise CheckpointError("checkpoint %s is corrupt" % path)
-    if doc.get("version") != CHECKPOINT_VERSION:
+    version = doc.get("version")
+    if version not in (CHECKPOINT_VERSION, CHECKPOINT_VERSION_DEDUP):
         raise CheckpointError("checkpoint version mismatch (expected %d, got %r)"
-                              % (CHECKPOINT_VERSION, doc.get("version")))
+                              % (CHECKPOINT_VERSION_DEDUP, version))
     if doc.get("config_fingerprint") != config.fingerprint():
         raise CheckpointError("checkpoint was written by a different configuration")
+    any_dedup = any(
+        spec.get("dedup_window") is not None for spec in config.sources
+    )
+    # Version 2 checkpoints predate dedup: they cannot be matched against a
+    # configuration that now requires window state; version 3 must be backed
+    # by at least one dedup source.
+    if version == CHECKPOINT_VERSION and any_dedup:
+        raise CheckpointError(
+            "checkpoint predates dedup_window; cannot recover window state"
+        )
+    if version == CHECKPOINT_VERSION_DEDUP and not any_dedup:
+        raise CheckpointError(
+            "checkpoint carries dedup state but the configuration sets no "
+            "dedup_window"
+        )
     sink_offset = doc.get("sink_offset")
     if (isinstance(sink_offset, bool) or not isinstance(sink_offset, int)
             or sink_offset < 0):
@@ -567,7 +693,9 @@ def _extract_envelope(obj, source_id, line_number):
     if not isinstance(obj["source_id"], str) or obj["source_id"] == "":
         raise DataValidationError("%s: source_id must be a non-empty string" % where)
     event_id = obj["event_id"]
-    if event_id is None or isinstance(event_id, (dict, list)):
+    # event_id is any JSON scalar (null included: null is a valid dedup key
+    # that matches only null); only arrays and objects are rejected.
+    if isinstance(event_id, (dict, list)):
         raise DataValidationError("%s: event_id must be a scalar" % where)
     if not isinstance(obj["payload"], dict):
         raise DataValidationError("%s: payload must be a JSON object" % where)
@@ -942,6 +1070,15 @@ def _commit_boundary(state, boundary, hasher, commit):
 
 def _emit_record(spec, state, config, sink, source_id, event_id, payload,
                  where):
+    # Dedup runs after the envelope is validated and before any transform:
+    # a duplicate is consumed (it counts toward the batch and the committed
+    # prefix and slides through the window) but is never transformed or
+    # emitted and never triggers a schema change. The window gains the key
+    # whether or not the record later survives a filter, so a filtered first
+    # occurrence still makes every later equal key a duplicate.
+    if state.note_event(event_id):
+        state.records += 1
+        return
     data = apply_transforms(payload, config.transforms, where)
     # Source-level transforms run after the shared ones, in their own
     # configured order.

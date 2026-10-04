@@ -7,6 +7,7 @@ A configuration is a YAML mapping with two keys::
         type: jsonl | csv
         path: <path to a JSON Lines file or a CSV file>
         batch_size: <positive integer>
+        dedup_window: <positive integer, optional>
         transforms:           # optional, source-level; run after the
           - op: ...           # shared top-level transforms
     transforms:
@@ -31,7 +32,7 @@ SUPPORTED_SOURCE_TYPES = ("jsonl", "csv")
 TRANSFORM_OPS = ("rename", "drop", "set", "cast", "filter")
 TOP_LEVEL_KEYS = ("sources", "transforms")
 SOURCE_REQUIRED_KEYS = ("id", "type", "path", "batch_size")
-SOURCE_KEYS = SOURCE_REQUIRED_KEYS + ("transforms",)
+SOURCE_KEYS = SOURCE_REQUIRED_KEYS + ("dedup_window", "transforms")
 
 
 def split_path(path):
@@ -162,6 +163,17 @@ def _validate_source(raw, index, seen_ids):
         raise ConfigurationError(
             "%s.batch_size must be a positive integer" % where
         )
+    # dedup_window is only added to the spec when it is configured, so its
+    # absence leaves the configuration fingerprint byte-identical to the
+    # pre-dedup layout (old checkpoints stay replayable).
+    dedup_window = None
+    if "dedup_window" in raw:
+        dedup_window = raw["dedup_window"]
+        if (isinstance(dedup_window, bool) or not isinstance(dedup_window, int)
+                or dedup_window < 1):
+            raise ConfigurationError(
+                "%s.dedup_window must be a positive integer" % where
+            )
     raw_transforms = raw.get("transforms", [])
     if not isinstance(raw_transforms, list):
         raise ConfigurationError("%s.transforms must be a list" % where)
@@ -171,13 +183,16 @@ def _validate_source(raw, index, seen_ids):
         for i, item in enumerate(raw_transforms)
     ]
     seen_ids.add(sid)
-    return {
+    spec = {
         "id": sid,
         "type": stype,
         "path": path,
         "batch_size": batch,
-        "transforms": transforms,
     }
+    if "dedup_window" in raw:
+        spec["dedup_window"] = dedup_window
+    spec["transforms"] = transforms
+    return spec
 
 
 class Config:

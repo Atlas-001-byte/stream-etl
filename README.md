@@ -39,6 +39,7 @@ sources:
     type: jsonl           # jsonl（逐行 JSON 对象）或 csv
     path: data/orders.jsonl
     batch_size: 100       # 正整数，每处理这么多条提交一次检查点
+    dedup_window: 100     # 可省略；正整数 N，按 event_id 对最近 N-1 条去重
     transforms:            # 可省略；来源级转换，在公共 transforms 之后按序执行
       - op: cast
         field: total
@@ -102,6 +103,34 @@ transforms:                # 可省略；按序执行，对全部 source 生效
   `data` 形状演进。无过滤项时每条输入恰好输出一次；有过滤项时命中的
   记录输出零次、其余恰好一次，replay 依旧不重复、不跳过。
 
+### 有界去重（dedup_window）
+
+每个 source 可配置正整数 `dedup_window: N`。该 source 为其已消费输入
+记录维护一个容量 `N - 1` 的滑动窗口，保存最近 `N - 1` 条记录的
+`event_id`：
+
+- 判定时机在记录信封校验之后、任何转换（公共与来源级）之前；窗口只以
+  `event_id` 为键，与 `payload`、转换、`filter` 无关。
+- 键比较按 JSON 标量语义：`null` 只匹配 `null`；布尔只匹配同值布尔；
+  整数与小数按数值相等（`1` 与 `1.0` 相同）；字符串按内容精确相等；
+  布尔不作为数值，数字不等于字符串。
+- 当前记录的键命中窗口中任意键即视为重复：重复项**仍被消费**——计入
+  `batch_size` 与已提交输入前缀，并滑入窗口——但不执行任何转换、不产生
+  输出、不触发 `schema_version` 变化。
+- 首次出现的键正常进入公共转换、来源级转换与 `filter`；无论该记录最终
+  是否被 `filter` 丢弃，它都已滑入窗口，因此窗口内后续同键记录仍按重复
+  处理。
+- `N = 1` 时容量为 0、窗口中没有任何历史记录，因此不会去重；不配置
+  `dedup_window` 的 source 行为与之前完全一致。窗口随每条已消费记录
+  滑动，滑出窗口的旧键再次出现会被当作首次出现而保留。
+- 窗口按 source 各自独立维护，source 之间互不影响；jsonl 与 csv 的去重
+  口径完全一致（CSV 的 `event_id` 恒为非空字符串）。
+- `dedup_window` 取布尔、零、负数、小数、字符串或其他类型都是
+  `ConfigurationError`（退出码 2）；jsonl 的 `event_id` 为数组或对象是
+  `DataValidationError`（退出码 3），`null` 与其他标量则是合法的键。
+- 配置 `dedup_window` 会进入配置指纹，改动它会使旧检查点不可恢复；
+  未配置时配置指纹与旧版逐字节一致，既有检查点可正常 replay。
+
 ## 记录格式（JSON Lines）
 
 输入每行一个 JSON 对象，至少包含：
@@ -145,13 +174,22 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
 
 检查点按逻辑记录边界记录每个 source 的进度：`offset` 为最后已提交记录
 结束处的字节偏移，`input_hash` 为输入字节前缀 `[0:offset]` 的 SHA-256。
+配置了 `dedup_window` 的 source 还会在每个已提交边界保存完整滑动窗口
+（`dedup_window` 与 `dedup_keys`），因此窗口随批次持久化、崩溃后可精确
+恢复；这会把检查点版本提升为 3，未配置去重的检查点仍为版本 2。
 
 - `run` 要求 `--output` 与 `--checkpoint` 均不存在；`replay` 要求两者
   均存在。
 - replay 先校验每个 source 的已提交输入前缀哈希一致且文件未变短，否则
   报告 `CheckpointError`（退出码 4）；随后截断 output 中超过已提交偏移
   的未提交尾部，再从最后已提交批次之后的下一条记录继续，不重复、不跳过。
+  去重窗口随已提交边界恢复，因此 replay 截断未提交输出后继续处理，得到
+  与一次性连续运行完全相同的保留记录与顺序；反复 replay 而无新输入时
+  结果确定。
 - 对 csv 源，进度定位于逻辑记录边界，因此跨物理行的记录也能精确恢复；
+- 检查点缺少或写坏去重窗口状态、保存的窗口与当前配置不一致（如
+  `dedup_window` 被改动）、窗口长度与记录数矛盾，或版本 2 检查点配合
+  配置了去重的配置，都是 `CheckpointError`（退出码 4）；
 - 无新记录时文件结果确定，可反复 replay。
 
 ## 错误与退出码
@@ -160,9 +198,9 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
 
 | 类型 | 退出码 | 触发场景 |
 | --- | --- | --- |
-| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径、过滤配置非法 |
-| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败、过滤条件无法求值 |
-| `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、已提交前缀改变或输入变短 |
+| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径、过滤配置非法、`dedup_window` 非正整数 |
+| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败、过滤条件无法求值、`event_id` 为数组或对象 |
+| `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、已提交前缀改变或输入变短、去重窗口状态缺失/损坏/与配置或记录数不一致 |
 | `SourceError` | 5 | 输入不可读 |
 | `SinkError` | 5 | 输出或检查点不可写 |
 

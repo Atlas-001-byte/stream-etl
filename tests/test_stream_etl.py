@@ -2209,3 +2209,616 @@ transforms:
                      "-p", str(cp)]) == 0
     assert [r["event_id"] for r in read_jsonl(out)] == ["1", "3"]
     assert read_checkpoint(cp)["sources"]["alpha"]["records"] == 3
+
+
+# --------------------------------------------------------------------------
+# Bounded dedup (dedup_window): configuration
+# --------------------------------------------------------------------------
+
+
+def test_config_dedup_window_accepted():
+    config = parse_config_text(
+        "sources:\n"
+        "  - id: s\n"
+        "    type: jsonl\n"
+        "    path: /tmp/x\n"
+        "    batch_size: 1\n"
+        "    dedup_window: 5\n"
+    )
+    src = config.sources[0]
+    assert src["dedup_window"] == 5
+    assert set(src) == {
+        "id", "type", "path", "batch_size", "dedup_window", "transforms"}
+
+
+def test_config_without_dedup_window_has_no_key():
+    # The key is absent (not normalised to None) so the fingerprint stays
+    # byte-identical to the pre-dedup configuration layout.
+    config = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n"
+    )
+    assert "dedup_window" not in config.sources[0]
+
+
+def test_config_dedup_window_one_accepted():
+    config = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n    dedup_window: 1\n"
+    )
+    assert config.sources[0]["dedup_window"] == 1
+
+
+@pytest.mark.parametrize("value", ["true", "0", "-3", "1.5", '"3"', "null"])
+def test_config_dedup_window_invalid(value):
+    yaml_text = (
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n    dedup_window: %s\n" % value
+    )
+    with pytest.raises(ConfigurationError) as exc:
+        parse_config_text(yaml_text)
+    assert "dedup_window" in str(exc.value)
+
+
+def test_config_dedup_window_enters_fingerprint():
+    without = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n"
+    )
+    with_window = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n    dedup_window: 4\n"
+    )
+    assert without.fingerprint() != with_window.fingerprint()
+    # changing the window size also changes the fingerprint
+    other = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n    dedup_window: 5\n"
+    )
+    assert with_window.fingerprint() != other.fingerprint()
+
+
+# --------------------------------------------------------------------------
+# Bounded dedup: sliding-window unit semantics
+# --------------------------------------------------------------------------
+
+
+def _dedup_state(window):
+    from stream_etl.engine import SourceState
+    return SourceState(
+        {"id": "s", "path": "/tmp/x", "transforms": [],
+         "dedup_window": window})
+
+
+def test_window_first_occurrence_then_duplicate():
+    st = _dedup_state(3)
+    assert st.note_event(1) is False
+    assert st.note_event(1) is True
+    assert list(st.window) == [1, 1]
+
+
+def test_window_numeric_cross_type_equality():
+    st = _dedup_state(4)
+    assert st.note_event(1) is False
+    assert st.note_event(1.0) is True        # int equals float by value
+    # the numeric-equivalent key is still in the window after the oldest 1
+    # slid out (capacity N-1 == 3): window is [1, 1.0, True] then look up 1
+    assert st.note_event(True) is False      # bool never equals a number
+    assert st.note_event(1) is True
+
+
+def test_window_bool_and_null_distinct():
+    st = _dedup_state(5)
+    assert st.note_event(True) is False
+    assert st.note_event(True) is True
+    assert st.note_event(1) is False
+    assert st.note_event(None) is False
+    assert st.note_event(None) is True
+    assert st.note_event(0) is False
+    assert st.note_event(False) is False
+    assert st.note_event("null") is False
+
+
+def test_window_string_exact_content():
+    st = _dedup_state(3)
+    assert st.note_event("x") is False
+    assert st.note_event("x") is True
+    assert st.note_event("X") is False
+
+
+def test_window_slides_old_keys_out():
+    st = _dedup_state(3)                   # capacity 2
+    assert st.note_event("a") is False
+    assert st.note_event("b") is False
+    assert st.note_event("a") is True       # a in [a, b]
+    assert st.note_event("c") is False      # window now [b, a]; add c -> [a, c]
+    assert st.note_event("b") is False      # b slid out: first occurrence again
+
+
+def test_window_size_one_never_dedups():
+    st = _dedup_state(1)
+    assert st.note_event("a") is False
+    assert st.note_event("a") is False
+    assert list(st.window) == []
+
+
+def test_window_disabled_state():
+    from stream_etl.engine import SourceState
+    st = SourceState({"id": "s", "path": "/tmp/x", "transforms": []})
+    assert st.window is None
+    assert st.note_event("a") is False
+    assert st.note_event("a") is False
+
+
+# --------------------------------------------------------------------------
+# Bounded dedup: jsonl end to end
+# --------------------------------------------------------------------------
+
+
+DEDUP_CFG = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: {batch}
+    dedup_window: {window}
+"""
+
+
+def run_dedup(work, rows, window=10, batch=10, cfg_text=None, extra=""):
+    src = work / "s.jsonl"
+    cfg = work / "c.yaml"
+    template = cfg_text or DEDUP_CFG
+    cfg.write_text(
+        template.format(src=str(src), batch=batch, window=window) + extra,
+        encoding="utf-8")
+    write_jsonl(src, rows)
+    out, cp = work / "o.jsonl", work / "cp.json"
+    rc = cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    return rc, out, cp, cfg, src
+
+
+def test_dedup_jsonl_basic_scalar_semantics(work):
+    rc, out, cp, _, _ = run_dedup(work, [
+        env_record("s", 1, {"v": "a"}),
+        env_record("s", 1.0, {"v": "b"}),       # numeric duplicate
+        env_record("s", "1", {"v": "c"}),       # string differs
+        env_record("s", True, {"v": "d"}),      # bool differs from number
+        env_record("s", None, {"v": "e"}),
+        env_record("s", None, {"v": "f"}),      # null duplicate
+    ], window=10)
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == [1, "1", True, None]
+    doc = read_checkpoint(cp)
+    assert doc["version"] == 3
+    assert doc["sources"]["s"]["records"] == 6
+    assert doc["sources"]["s"]["dedup_window"] == 10
+    assert doc["sink_offset"] == out.stat().st_size
+
+
+def test_dedup_window_boundary_slide(work):
+    # window 3 -> remember only the last 2 consumed keys
+    rc, out, _, _, _ = run_dedup(work, [
+        env_record("s", 1, {"v": 0}),
+        env_record("s", 2, {"v": 1}),
+        env_record("s", 1, {"v": 2}),            # dup
+        env_record("s", 3, {"v": 3}),
+        env_record("s", 1, {"v": 4}),            # 1 still in [1,3] -> dup
+        env_record("s", 2, {"v": 5}),            # 2 slid out -> kept
+    ], window=3)
+    assert rc == 0
+    assert [r["data"]["v"] for r in read_jsonl(out)] == [0, 1, 3, 5]
+
+
+def test_dedup_size_one_emits_everything(work):
+    rc, out, cp, _, _ = run_dedup(work, [
+        env_record("s", 1, {"v": 1}),
+        env_record("s", 1, {"v": 2}),
+        env_record("s", 1, {"v": 3}),
+    ], window=1)
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["data"]["v"] for r in rows] == [1, 2, 3]
+    assert read_checkpoint(cp)["sources"]["s"]["dedup_keys"] == []
+
+
+def test_dedup_duplicates_count_toward_batch(work):
+    # batch_size 2; duplicates still advance the committed record boundary.
+    rc, out, cp, _, _ = run_dedup(work, [
+        env_record("s", 1, {"v": 0}),
+        env_record("s", 1, {"v": 1}),            # dup -> commit after it
+        env_record("s", 2, {"v": 2}),
+        env_record("s", 2, {"v": 3}),            # dup -> commit after it
+        env_record("s", 3, {"v": 4}),
+    ], window=5, batch=2)
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == [1, 2, 3]
+    assert read_checkpoint(cp)["sources"]["s"]["records"] == 5
+
+
+def test_dedup_duplicate_does_not_change_schema(work):
+    # A duplicate carrying a wildly different payload shape must not bump
+    # schema_version, nor must a different-shaped duplicate prime a shape.
+    rc, out, cp, _, _ = run_dedup(work, [
+        env_record("s", 1, {"a": 1}),
+        env_record("s", 1, {"a": 1, "b": 2, "c": [{"x": 1}]}),  # dup
+        env_record("s", 2, {"a": 1}),
+    ], window=5)
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["schema_version"] for r in rows] == [1, 1]
+    assert read_checkpoint(cp)["sources"]["s"]["schema_version"] == 1
+
+
+def test_dedup_runs_before_transforms(work):
+    # The duplicate's payload would fail the cast if it were transformed;
+    # dedup must short-circuit before any transform runs.
+    rc, out, _, _, _ = run_dedup(work, [
+        env_record("s", 1, {"n": "1"}),
+        env_record("s", 1, {"n": "not-a-number"}),  # dup, cast never runs
+        env_record("s", 2, {"n": "2"}),
+    ], window=5, extra="transforms:\n  - op: cast\n    field: n\n    type: integer\n")
+    assert rc == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == [1, 2]
+
+
+def test_dedup_filtered_first_occurrence_still_marks_key(work):
+    rc, out, cp, _, _ = run_dedup(work, [
+        env_record("s", "x", {"keep": "no"}),     # filtered, but consumed
+        env_record("s", "x", {"keep": "yes"}),    # still a duplicate
+        env_record("s", "y", {"keep": "yes"}),
+    ], window=10, extra=(
+        "transforms:\n  - op: filter\n    field: keep\n"
+        '    compare: eq\n    value: "yes"\n'))
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == ["y"]
+    assert read_checkpoint(cp)["sources"]["s"]["records"] == 3
+
+
+def test_dedup_event_id_null_is_valid_scalar(work):
+    rc, out, _, _, _ = run_dedup(work, [
+        env_record("s", None, {"v": 1}),
+        env_record("s", None, {"v": 2}),
+    ], window=3)
+    assert rc == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == [None]
+
+
+@pytest.mark.parametrize("eid", [[1, 2], {"x": 1}])
+def test_dedup_event_id_array_or_object_is_data_error(work, capsys, eid):
+    rc, _, _, _, _ = run_dedup(work, [
+        {"source_id": "s", "event_id": eid, "payload": {"v": 1}},
+    ], window=3)
+    assert rc == 3
+    assert "event_id must be a scalar" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Bounded dedup: replay equivalence, batching, idempotence
+# --------------------------------------------------------------------------
+
+
+DEDUP_ROWS = [
+    env_record("s", 1, {"v": 0}),
+    env_record("s", 2, {"v": 1}),
+    env_record("s", 1, {"v": 2}),
+    env_record("s", 3, {"v": 3}),
+    env_record("s", 2, {"v": 4}),
+    env_record("s", 4, {"v": 5}),
+    env_record("s", 1, {"v": 6}),
+]
+
+
+def test_dedup_replay_segmented_matches_continuous(work):
+    # Continuous reference.
+    rc, cont_out, cont_cp, _, _ = run_dedup(
+        work, DEDUP_ROWS, window=4, batch=2)
+    assert rc == 0
+    cont_bytes = cont_out.read_bytes()
+    cont_keys = read_checkpoint(cont_cp)["sources"]["s"]["dedup_keys"]
+
+    # Segmented: first 3 records committed, then append and replay.
+    seg = work / "seg"
+    seg.mkdir()
+    seg_src = seg / "s.jsonl"
+    seg_cfg = seg / "c.yaml"
+    seg_cfg.write_text(
+        DEDUP_CFG.format(src=str(seg_src), batch=2, window=4),
+        encoding="utf-8")
+    write_jsonl(seg_src, DEDUP_ROWS[:3])
+    seg_out, seg_cp = seg / "o.jsonl", seg / "cp.json"
+    assert cli_main(["run", "-c", str(seg_cfg), "-o", str(seg_out),
+                     "-p", str(seg_cp)]) == 0
+    with open(seg_src, "a", encoding="utf-8") as fp:
+        for row in DEDUP_ROWS[3:]:
+            fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+    assert cli_main(["replay", "-c", str(seg_cfg), "-o", str(seg_out),
+                     "-p", str(seg_cp)]) == 0
+    assert seg_out.read_bytes() == cont_bytes
+    assert (read_checkpoint(seg_cp)["sources"]["s"]["dedup_keys"]
+            == cont_keys)
+
+
+def test_dedup_replay_idempotent_without_new_input(work):
+    rc, out, cp, _, _ = run_dedup(work, DEDUP_ROWS, window=4, batch=2)
+    assert rc == 0
+    size, cp_bytes = out.stat().st_size, cp.read_bytes()
+    assert cli_main(["replay", "-c", str(work / "c.yaml"), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    assert out.stat().st_size == size
+    assert cp.read_bytes() == cp_bytes
+
+
+def test_dedup_window_restored_after_failed_batch(work):
+    # batch_size 2; the third record is a duplicate and the fourth fails a
+    # cast, so the batch spanning them never commits. On replay the window
+    # must be restored to the committed state and the duplicate re-decided.
+    src = work / "s.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(
+        DEDUP_CFG.format(src=str(src), batch=2, window=5)
+        + "transforms:\n  - op: cast\n    field: n\n    type: integer\n",
+        encoding="utf-8")
+    write_jsonl(src, [
+        env_record("s", 1, {"n": "1"}),
+        env_record("s", 2, {"n": "2"}),
+        env_record("s", 1, {"n": "3"}),          # duplicate
+        env_record("s", 3, {"n": "bad"}),        # cast failure
+    ])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 3
+    assert [r["event_id"] for r in read_jsonl(out)] == [1, 2]
+    assert read_checkpoint(cp)["sources"]["s"]["records"] == 2
+
+    # repair and replay: record 3 stays a duplicate against the restored
+    # window; record 3 (key 3) is emitted once.
+    write_jsonl(src, [
+        env_record("s", 1, {"n": "1"}),
+        env_record("s", 2, {"n": "2"}),
+        env_record("s", 1, {"n": "3"}),
+        env_record("s", 3, {"n": "4"}),
+    ])
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    assert [(r["event_id"], r["data"]["n"]) for r in rows] == [
+        (1, 1), (2, 2), (3, 4)]
+    doc = read_checkpoint(cp)
+    assert doc["sources"]["s"]["records"] == 4
+    # the duplicate (second key 1) slid through the window like every
+    # consumed record, so it is part of the restored keys
+    assert doc["sources"]["s"]["dedup_keys"] == [1, 2, 1, 3]
+
+
+def test_dedup_replay_appends_after_window_slid(work):
+    src = work / "s.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(
+        DEDUP_CFG.format(src=str(src), batch=10, window=3), encoding="utf-8")
+    write_jsonl(src, [
+        env_record("s", 1, {"v": 0}),
+        env_record("s", 2, {"v": 1}),
+        env_record("s", 3, {"v": 2}),
+    ])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+    # committed window is [2, 3]; key 1 has slid out so it is a first
+    # occurrence again, while key 3 is still windowed and stays a duplicate
+    with open(src, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(env_record("s", 1, {"v": 3})) + "\n")
+        fp.write(json.dumps(env_record("s", 3, {"v": 4})) + "\n")
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    assert [r["data"]["v"] for r in read_jsonl(out)] == [0, 1, 2, 3]
+    doc = read_checkpoint(cp)
+    assert doc["sources"]["s"]["records"] == 5
+    assert doc["sources"]["s"]["dedup_keys"] == [1, 3]
+
+
+# --------------------------------------------------------------------------
+# Bounded dedup: per-source isolation and checkpoint compatibility
+# --------------------------------------------------------------------------
+
+
+def test_dedup_windows_are_isolated_between_sources(work):
+    a, b = work / "a.jsonl", work / "b.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(
+        "sources:\n"
+        "  - id: a\n    type: jsonl\n    path: %s\n    batch_size: 1\n"
+        "    dedup_window: 5\n"
+        "  - id: b\n    type: jsonl\n    path: %s\n    batch_size: 1\n"
+        % (a, b), encoding="utf-8")
+    write_jsonl(a, [env_record("a", 1, {}), env_record("a", 1, {})])
+    write_jsonl(b, [env_record("b", 1, {}), env_record("b", 1, {})])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    # source a dedups; source b (no window) keeps both
+    assert [(r["source_id"], r["event_id"]) for r in rows] == [
+        ("a", 1), ("b", 1), ("b", 1)]
+    doc = read_checkpoint(cp)
+    assert doc["version"] == 3
+    assert "dedup_keys" in doc["sources"]["a"]
+    assert "dedup_keys" not in doc["sources"]["b"]
+
+
+def test_checkpoint_without_dedup_stays_version_2(work):
+    rc, out, cp, _ = run_simple(work, [
+        env_record("s", 1, {"a": 1}),
+        env_record("s", 1, {"a": 2}),
+    ])
+    assert rc == 0
+    doc = read_checkpoint(cp)
+    assert doc["version"] == 2
+    assert "dedup_keys" not in doc["sources"]["s"]
+    assert "dedup_window" not in doc["sources"]["s"]
+
+
+def _mutate_checkpoint(cp, mutator):
+    doc = read_checkpoint(cp)
+    mutator(doc)
+    cp.write_text(json.dumps(doc), encoding="utf-8")
+
+
+def test_dedup_replay_checkpoint_error_cases(work, capsys):
+    rc, out, cp, cfg, src = run_dedup(work, [
+        env_record("s", 1, {"v": 1}),
+        env_record("s", 2, {"v": 2}),
+    ], window=3, batch=1)
+    assert rc == 0
+    with open(src, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(env_record("s", 3, {"v": 3})) + "\n")
+
+    def expect_error(mutator, needle):
+        backup = cp.read_bytes()
+        _mutate_checkpoint(cp, mutator)
+        r = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+        assert r == 4
+        assert needle in capsys.readouterr().err
+        cp.write_bytes(backup)
+
+    expect_error(lambda d: d["sources"]["s"].pop("dedup_keys"),
+                 "missing the dedup window")
+    expect_error(lambda d: d["sources"]["s"].pop("dedup_window"),
+                 "missing the dedup window")
+    expect_error(lambda d: d["sources"]["s"].__setitem__("dedup_window", 9),
+                 "configuration is 3")
+    expect_error(lambda d: d["sources"]["s"].__setitem__(
+        "dedup_keys", [1, 2, 3]), "exceeds its configured window")
+    expect_error(lambda d: d["sources"]["s"].__setitem__(
+        "dedup_keys", [9]), "inconsistent with its record count")
+    expect_error(lambda d: d["sources"]["s"].__setitem__(
+        "dedup_keys", [[1], 2]), "non-scalar event_id")
+    expect_error(lambda d: d["sources"]["s"].__setitem__(
+        "dedup_keys", 5), "window for source 's' is invalid")
+    expect_error(lambda d: d.__setitem__("version", 2),
+                 "predates dedup_window")
+
+
+def test_dedup_old_version2_checkpoint_rejected_with_dedup_config(
+        work, capsys):
+    rc, out, cp, cfg, src = run_dedup(work, [
+        env_record("s", 1, {"v": 1}),
+    ], window=3, batch=1)
+    assert rc == 0
+    _mutate_checkpoint(cp, lambda d: d.__setitem__("version", 2))
+    r = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert r == 4
+    assert "predates dedup_window" in capsys.readouterr().err
+
+
+def test_dedup_window_change_invalidates_checkpoint(work, capsys):
+    rc, out, cp, cfg, src = run_dedup(work, [
+        env_record("s", 1, {"v": 1}),
+    ], window=3, batch=1)
+    assert rc == 0
+    cfg.write_text(
+        DEDUP_CFG.format(src=str(src), batch=1, window=4), encoding="utf-8")
+    r = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert r == 4
+    assert "different configuration" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Bounded dedup: CSV sources
+# --------------------------------------------------------------------------
+
+
+CSV_DEDUP_CFG = """
+sources:
+  - id: alpha
+    type: csv
+    path: {src}
+    batch_size: {batch}
+    dedup_window: {window}
+"""
+
+
+def run_csv_dedup(work, text, window=3, batch=10, cfg_text=None):
+    src = work / "s.csv"
+    cfg = work / "c.yaml"
+    write_csv(src, text)
+    cfg.write_text((cfg_text or CSV_DEDUP_CFG).format(
+        src=str(src), batch=batch, window=window), encoding="utf-8")
+    out, cp = work / "o.jsonl", work / "cp.json"
+    rc = cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    return rc, out, cp, cfg, src
+
+
+def test_csv_dedup_basic(work):
+    rc, out, cp, _, _ = run_csv_dedup(
+        work, "source_id,event_id,v\n"
+              "alpha,1,a\n"
+              "alpha,1,b\n"
+              "alpha,2,c\n"
+              "alpha,1,d\n")
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [(r["event_id"], r["data"]["v"]) for r in rows] == [
+        ("1", "a"), ("2", "c")]
+    doc = read_checkpoint(cp)
+    assert doc["version"] == 3
+    assert doc["sources"]["alpha"]["records"] == 4
+    assert doc["sources"]["alpha"]["dedup_keys"] == ["2", "1"]
+
+
+def test_csv_dedup_parity_with_jsonl_slide(work):
+    rc, out, _, _, _ = run_csv_dedup(
+        work, "source_id,event_id,v\n"
+              "alpha,a,0\n"
+              "alpha,b,1\n"
+              "alpha,a,2\n"
+              "alpha,c,3\n"
+              "alpha,b,4\n", window=3)
+    assert rc == 0
+    # a repeats inside the window (dropped); b slides out and is kept again
+    assert [r["data"]["v"] for r in read_jsonl(out)] == ["0", "1", "3", "4"]
+
+
+def test_csv_dedup_replay(work):
+    src = work / "s.csv"
+    cfg = work / "c.yaml"
+    cfg.write_text(CSV_DEDUP_CFG.format(src=str(src), batch=2, window=10),
+                   encoding="utf-8")
+    write_csv(src, "source_id,event_id,v\n"
+                   "alpha,1,a\n"
+                   "alpha,1,b\n"
+                   "alpha,2,c\n")
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+    with open(src, "a", encoding="utf-8") as fp:
+        fp.write("alpha,2,d\nalpha,3,e\n")
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == ["1", "2", "3"]
+    assert read_checkpoint(cp)["sources"]["alpha"]["records"] == 5
+
+
+def test_csv_dedup_with_filter(work):
+    cfg = """
+sources:
+  - id: alpha
+    type: csv
+    path: {src}
+    batch_size: {batch}
+    dedup_window: {window}
+transforms:
+  - op: filter
+    field: keep
+    compare: eq
+    value: "yes"
+"""
+    rc, out, cp, _, _ = run_csv_dedup(
+        work, "source_id,event_id,keep,v\n"
+              "alpha,1,no,a\n"
+              "alpha,1,yes,b\n"
+              "alpha,2,yes,c\n", window=5, cfg_text=cfg)
+    assert rc == 0
+    # first 1 is filtered but still consumed, so the second 1 is a duplicate
+    assert [r["event_id"] for r in read_jsonl(out)] == ["2"]
+    assert read_checkpoint(cp)["sources"]["alpha"]["records"] == 3
+
