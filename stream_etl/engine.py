@@ -562,6 +562,9 @@ def _process(config, states, sink, checkpoint_path):
                         % (where, source_id)
                     )
                 data = apply_transforms(payload, config.transforms, where)
+                # Source-level transforms run after the shared ones, in
+                # their own configured order.
+                data = apply_transforms(data, spec["transforms"], where)
                 state.note_schema(schema_fingerprint(data))
                 record = {
                     "source_id": source_id,

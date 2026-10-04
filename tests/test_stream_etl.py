@@ -974,3 +974,253 @@ def test_binary_error_prefix_and_code(work):
     )
     assert proc.returncode == 2
     assert proc.stderr.startswith("Error: ConfigurationError")
+
+
+# --------------------------------------------------------------------------
+# Source-level transforms
+# --------------------------------------------------------------------------
+
+
+def test_config_source_transforms_validated():
+    config = parse_config_text(
+        "sources:\n"
+        "  - id: s\n"
+        "    type: jsonl\n"
+        "    path: /tmp/x\n"
+        "    batch_size: 1\n"
+        "    transforms:\n"
+        "      - op: rename\n"
+        "        from: a\n"
+        "        to: b\n"
+        "      - op: cast\n"
+        "        field: b\n"
+        "        type: integer\n"
+    )
+    assert config.sources[0]["transforms"] == [
+        {"op": "rename", "from": "a", "to": "b"},
+        {"op": "cast", "field": "b", "type": "integer"},
+    ]
+    # a source without transforms normalises to an empty list
+    config = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n"
+    )
+    assert config.sources[0]["transforms"] == []
+
+
+@pytest.mark.parametrize(
+    "transforms_yaml,needle",
+    [
+        ("    transforms: nope\n", "list"),
+        ("    transforms:\n      - field: a\n", "missing 'op'"),
+        ("    transforms:\n      - op: frobnicate\n", "unknown operation"),
+        ("    transforms:\n      - op: drop\n        field: a\n"
+         "        extra: 1\n", "unknown keys"),
+        ("    transforms:\n      - op: drop\n        field: .bad\n", "path"),
+        ("    transforms:\n      - op: cast\n        field: a\n"
+         "        type: float\n", "cast"),
+        ("    transforms:\n      - op: set\n        field: a\n"
+         "        value:\n          x: 1\n", "scalar"),
+    ],
+)
+def test_config_source_transforms_errors(transforms_yaml, needle):
+    yaml_text = (
+        "sources:\n"
+        "  - id: s\n"
+        "    type: jsonl\n"
+        "    path: /tmp/x\n"
+        "    batch_size: 1\n"
+        + transforms_yaml
+    )
+    with pytest.raises(ConfigurationError) as exc:
+        parse_config_text(yaml_text)
+    assert needle in str(exc.value)
+
+
+def test_config_source_unknown_key_still_rejected():
+    with pytest.raises(ConfigurationError) as exc:
+        parse_config_text(
+            "sources:\n"
+            "  - id: s\n"
+            "    type: jsonl\n"
+            "    path: /tmp/x\n"
+            "    batch_size: 1\n"
+            "    transform: []\n"
+        )
+    assert "unknown keys" in str(exc.value)
+
+
+SRC_LEVEL_CFG = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: 2
+    transforms:
+      - op: cast
+        field: total
+        type: number
+      - op: set
+        field: tag
+        value: src
+transforms:
+  - op: rename
+    from: amount
+    to: total
+  - op: drop
+    field: secret
+"""
+
+
+def test_source_transforms_run_after_shared_ones(work):
+    # The source-level cast sees `total`, which only exists after the shared
+    # rename; the shared drop removed `secret` before source transforms run.
+    rc, out, cp, _ = run_simple(work, [
+        env_record("s", 1, {"amount": "10.5", "secret": "x"}),
+        env_record("s", 2, {"amount": "2", "secret": "y"}),
+    ], cfg_text=SRC_LEVEL_CFG)
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["data"] for r in rows] == [
+        {"total": 10.5, "tag": "src"},
+        {"total": 2.0, "tag": "src"},
+    ]
+    assert [r["schema_version"] for r in rows] == [1, 1]
+    doc = read_checkpoint(cp)
+    assert doc["sources"]["s"]["records"] == 2
+    assert doc["sink_offset"] == out.stat().st_size
+
+
+def test_source_transforms_schema_versioning(work):
+    cfg = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: 10
+    transforms:
+      - op: cast
+        field: v
+        type: integer
+"""
+    rc, out, _, _ = run_simple(work, [
+        env_record("s", 1, {"v": "1", "keep": "a"}),
+        env_record("s", 2, {"v": "2", "keep": "a", "extra": 1}),  # add field
+        env_record("s", 3, {"v": "3", "keep": "b"}),              # drop field
+        env_record("s", 4, {"v": "4", "keep": "c"}),              # values only
+    ], cfg_text=cfg)
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["schema_version"] for r in rows] == [1, 2, 3, 3]
+    assert all(isinstance(r["data"]["v"], int) for r in rows)
+
+
+def test_source_transforms_error_skips_batch_commit(work):
+    src = work / "s.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(SRC_LEVEL_CFG.format(src=str(src)), encoding="utf-8")
+    write_jsonl(src, [
+        env_record("s", 0, {"amount": "1", "secret": "a"}),
+        env_record("s", 1, {"amount": "2", "secret": "b"}),
+        env_record("s", 2, {"amount": "not-a-number", "secret": "c"}),
+    ])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    rc = cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 3
+    # batch of records 0,1 committed; the failing record's batch is not
+    assert [r["event_id"] for r in read_jsonl(out)] == [0, 1]
+    assert read_checkpoint(cp)["sources"]["s"]["records"] == 2
+
+    # repair the input and replay: continue without duplicates or gaps
+    write_jsonl(src, [
+        env_record("s", 0, {"amount": "1", "secret": "a"}),
+        env_record("s", 1, {"amount": "2", "secret": "b"}),
+        env_record("s", 2, {"amount": "3", "secret": "c"}),
+    ])
+    rc = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == [0, 1, 2]
+    assert rows[2]["data"] == {"total": 3.0, "tag": "src"}
+    assert read_checkpoint(cp)["sources"]["s"]["records"] == 3
+
+
+MULTI_SRC_LEVEL_CFG = """
+sources:
+  - id: a
+    type: jsonl
+    path: {a}
+    batch_size: 2
+    transforms:
+      - op: set
+        field: origin
+        value: alpha
+  - id: b
+    type: jsonl
+    path: {b}
+    batch_size: 2
+transforms:
+  - op: rename
+    from: k
+    to: key
+"""
+
+
+def test_source_transforms_multi_source_isolated(work):
+    a = work / "a.jsonl"
+    b = work / "b.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(MULTI_SRC_LEVEL_CFG.format(a=str(a), b=str(b)),
+                   encoding="utf-8")
+    write_jsonl(a, [env_record("a", i, {"k": i}) for i in range(3)])
+    write_jsonl(b, [env_record("b", i, {"k": i}) for i in range(2)])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    # shared rename applies to both; the source-level set only to source a
+    assert [r["data"] for r in rows] == [
+        {"key": 0, "origin": "alpha"},
+        {"key": 1, "origin": "alpha"},
+        {"key": 2, "origin": "alpha"},
+        {"key": 0},
+        {"key": 1},
+    ]
+    assert [r["schema_version"] for r in rows] == [1, 1, 1, 1, 1]
+    doc = read_checkpoint(cp)
+    assert doc["sources"]["a"]["records"] == 3
+    assert doc["sources"]["b"]["records"] == 2
+
+    # append to both inputs and replay: per-source state resumes cleanly
+    with open(a, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(env_record("a", 3, {"k": 3})) + "\n")
+    with open(b, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(env_record("b", 2, {"k": 2, "new": 1})) + "\n")
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    assert [(r["source_id"], r["event_id"]) for r in rows] == [
+        ("a", 0), ("a", 1), ("a", 2), ("b", 0), ("b", 1),
+        ("a", 3), ("b", 2),
+    ]
+    assert rows[5]["data"] == {"key": 3, "origin": "alpha"}
+    assert rows[6]["data"] == {"key": 2, "new": 1}
+    # source b gained a field -> its schema version advances independently
+    assert [r["schema_version"] for r in rows] == [1, 1, 1, 1, 1, 1, 2]
+
+
+def test_source_transforms_in_config_fingerprint(work, capsys):
+    src = work / "s.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(SRC_LEVEL_CFG.format(src=str(src)), encoding="utf-8")
+    write_jsonl(src, [env_record("s", 1, {"amount": "1", "secret": "a"})])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+    # changing only the source-level transforms must invalidate the checkpoint
+    cfg.write_text(
+        SRC_LEVEL_CFG.format(src=str(src)).replace("value: src",
+                                                   "value: other"),
+        encoding="utf-8",
+    )
+    rc = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 4
+    assert "different configuration" in capsys.readouterr().err

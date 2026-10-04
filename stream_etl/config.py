@@ -7,6 +7,8 @@ A configuration is a YAML mapping with two keys::
         type: jsonl
         path: <path to a JSON Lines file>
         batch_size: <positive integer>
+        transforms:           # optional, source-level; run after the
+          - op: ...           # shared top-level transforms
     transforms:
       - op: rename | drop | set | cast
         ...
@@ -26,7 +28,8 @@ CAST_TYPES = ("string", "integer", "number", "boolean")
 SUPPORTED_SOURCE_TYPES = ("jsonl",)
 TRANSFORM_OPS = ("rename", "drop", "set", "cast")
 TOP_LEVEL_KEYS = ("sources", "transforms")
-SOURCE_KEYS = ("id", "type", "path", "batch_size")
+SOURCE_REQUIRED_KEYS = ("id", "type", "path", "batch_size")
+SOURCE_KEYS = SOURCE_REQUIRED_KEYS + ("transforms",)
 
 
 def split_path(path):
@@ -46,8 +49,8 @@ def _require_mapping(value, what):
         raise ConfigurationError("%s must be a mapping" % what)
 
 
-def _validate_transform(raw, index):
-    where = "transforms[%d]" % index
+def _validate_transform(raw, index, prefix="transforms"):
+    where = "%s[%d]" % (prefix, index)
     if not isinstance(raw, dict):
         raise ConfigurationError("%s must be a mapping" % where)
     if "op" not in raw:
@@ -102,7 +105,7 @@ def _validate_source(raw, index, seen_ids):
     where = "sources[%d]" % index
     if not isinstance(raw, dict):
         raise ConfigurationError("%s must be a mapping" % where)
-    missing = [k for k in SOURCE_KEYS if k not in raw]
+    missing = [k for k in SOURCE_REQUIRED_KEYS if k not in raw]
     if missing:
         raise ConfigurationError(
             "%s is incomplete, missing: %s" % (where, ", ".join(missing))
@@ -112,7 +115,7 @@ def _validate_source(raw, index, seen_ids):
         raise ConfigurationError(
             "%s has unknown keys: %s" % (where, ", ".join(sorted(extra)))
         )
-    sid, stype, path, batch = (raw[k] for k in SOURCE_KEYS)
+    sid, stype, path, batch = (raw[k] for k in SOURCE_REQUIRED_KEYS)
     if not isinstance(sid, str) or sid == "":
         raise ConfigurationError("%s.id must be a non-empty string" % where)
     if sid in seen_ids:
@@ -127,8 +130,22 @@ def _validate_source(raw, index, seen_ids):
         raise ConfigurationError(
             "%s.batch_size must be a positive integer" % where
         )
+    raw_transforms = raw.get("transforms", [])
+    if not isinstance(raw_transforms, list):
+        raise ConfigurationError("%s.transforms must be a list" % where)
+    prefix = "%s.transforms" % where
+    transforms = [
+        _validate_transform(item, i, prefix)
+        for i, item in enumerate(raw_transforms)
+    ]
     seen_ids.add(sid)
-    return {"id": sid, "type": stype, "path": path, "batch_size": batch}
+    return {
+        "id": sid,
+        "type": stype,
+        "path": path,
+        "batch_size": batch,
+        "transforms": transforms,
+    }
 
 
 class Config:
