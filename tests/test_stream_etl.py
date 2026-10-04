@@ -1695,3 +1695,517 @@ def test_csv_binary_end_to_end(work):
         capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
     assert [r["event_id"] for r in read_jsonl(out)] == ["1", "2"]
+
+
+# --------------------------------------------------------------------------
+# Filter transforms: configuration validation
+# --------------------------------------------------------------------------
+
+
+def test_config_filter_valid_top_and_source_level():
+    config = parse_config_text(
+        "sources:\n"
+        "  - id: s\n"
+        "    type: jsonl\n"
+        "    path: /tmp/x\n"
+        "    batch_size: 1\n"
+        "    transforms:\n"
+        "      - op: filter\n"
+        "        field: age\n"
+        "        compare: gte\n"
+        "        value: 18\n"
+        "transforms:\n"
+        "  - op: filter\n"
+        "    field: meta.tag\n"
+        "    compare: ne\n"
+        "    value: junk\n"
+    )
+    assert config.transforms == [
+        {"op": "filter", "field": "meta.tag", "compare": "ne",
+         "value": "junk"},
+    ]
+    assert config.sources[0]["transforms"] == [
+        {"op": "filter", "field": "age", "compare": "gte", "value": 18},
+    ]
+
+
+@pytest.mark.parametrize(
+    "body,needle",
+    [
+        ("        compare: eq\n        value: 1\n", "requires 'field'"),
+        ("        field: a\n        value: 1\n", "requires 'compare'"),
+        ("        field: a\n        compare: eq\n", "requires 'value'"),
+        ("        field: a\n        compare: equal\n        value: 1\n",
+         "compare"),
+        ("        field: .bad\n        compare: eq\n        value: 1\n",
+         "path"),
+        ("        field: a\n        compare: eq\n        value: []\n",
+         "scalar"),
+        ("        field: a\n        compare: eq\n        value:\n"
+         "          x: 1\n", "scalar"),
+        ("        field: a\n        compare: lt\n        value: abc\n",
+         "finite numeric"),
+        ("        field: a\n        compare: gte\n        value: true\n",
+         "finite numeric"),
+        ("        field: a\n        compare: lte\n        value: null\n",
+         "finite numeric"),
+        ("        field: a\n        compare: eq\n        value: 1\n"
+         "        extra: 2\n", "unknown keys"),
+    ],
+)
+def test_config_filter_errors(body, needle):
+    yaml_text = (
+        "sources:\n"
+        "  - id: s\n"
+        "    type: jsonl\n"
+        "    path: /tmp/x\n"
+        "    batch_size: 1\n"
+        "    transforms:\n"
+        "      - op: filter\n"
+        + body
+    )
+    with pytest.raises(ConfigurationError) as exc:
+        parse_config_text(yaml_text)
+    assert needle in str(exc.value)
+
+
+def test_config_filter_error_exit_code_2(work, capsys):
+    src = work / "s.jsonl"
+    write_jsonl(src, [env_record("s", 1, {"a": 1})])
+    cfg = work / "c.yaml"
+    cfg.write_text(
+        "sources:\n"
+        "  - id: s\n"
+        "    type: jsonl\n"
+        "    path: %s\n"
+        "    batch_size: 1\n"
+        "transforms:\n"
+        "  - op: filter\n"
+        "    field: a\n"
+        "    compare: gt\n" % src,
+        encoding="utf-8",
+    )
+    rc = cli_main(["run", "-c", str(cfg), "-o", str(work / "o"),
+                   "-p", str(work / "cp")])
+    assert rc == 2
+    assert capsys.readouterr().err.startswith("Error: ConfigurationError")
+
+
+# --------------------------------------------------------------------------
+# Filter transforms: comparison semantics (unit level)
+# --------------------------------------------------------------------------
+
+
+def keep(data, transforms):
+    return engine.apply_transforms(data, transforms, "test") is not None
+
+
+def test_filter_eq_string():
+    flt = [{"op": "filter", "field": "tag", "compare": "eq", "value": "x"}]
+    assert keep({"tag": "x"}, flt)
+    assert not keep({"tag": "y"}, flt)
+    assert not keep({"tag": "X"}, flt)          # exact content
+    assert not keep({"tag": 1}, flt)            # number != string
+
+
+def test_filter_eq_null_and_bool():
+    eq_null = [{"op": "filter", "field": "v", "compare": "eq", "value": None}]
+    assert keep({"v": None}, eq_null)
+    assert not keep({"v": 0}, eq_null)
+    assert not keep({"v": False}, eq_null)
+    assert not keep({"v": ""}, eq_null)
+    eq_true = [{"op": "filter", "field": "v", "compare": "eq", "value": True}]
+    assert keep({"v": True}, eq_true)
+    assert not keep({"v": False}, eq_true)
+    assert not keep({"v": 1}, eq_true)          # bool is not a number
+    assert not keep({"v": "true"}, eq_true)
+
+
+def test_filter_eq_numeric_across_types():
+    flt = [{"op": "filter", "field": "v", "compare": "eq", "value": 1.5}]
+    assert keep({"v": 1.5}, flt)
+    assert keep({"v": 1.50}, flt)
+    assert not keep({"v": 2}, flt)
+    int_flt = [{"op": "filter", "field": "v", "compare": "eq", "value": 2}]
+    assert keep({"v": 2.0}, int_flt)            # int matches float by value
+    assert not keep({"v": True}, int_flt)
+
+
+def test_filter_ne():
+    flt = [{"op": "filter", "field": "v", "compare": "ne", "value": "x"}]
+    assert not keep({"v": "x"}, flt)
+    assert keep({"v": "y"}, flt)
+    assert keep({"v": None}, flt)
+    assert keep({"v": 1}, flt)
+
+
+@pytest.mark.parametrize(
+    "compare,value,kept,dropped",
+    [
+        ("lt", 10, [1, 9.5, -3], [10, 11]),
+        ("lte", 10, [1, 10, 10.0], [10.5, 11]),
+        ("gt", 10, [11, 10.5], [10, 9]),
+        ("gte", 10, [10, 10.0, 11], [9.5]),
+    ],
+)
+def test_filter_ordering(compare, value, kept, dropped):
+    flt = [{"op": "filter", "field": "v", "compare": compare,
+            "value": value}]
+    for number in kept:
+        assert keep({"v": number}, flt)
+    for number in dropped:
+        assert not keep({"v": number}, flt)
+
+
+def test_filter_nested_path():
+    flt = [{"op": "filter", "field": "a.b.c", "compare": "eq", "value": 1}]
+    assert keep({"a": {"b": {"c": 1}}}, flt)
+    assert not keep({"a": {"b": {"c": 2}}}, flt)
+
+
+@pytest.mark.parametrize(
+    "data,compare",
+    [
+        ({}, "eq"),                             # field missing
+        ({"a": 1}, "eq"),                       # field missing
+        ({"a": {"b": 1}}, "eq"),                # a.b missing below a
+        ({"v": [1, 2]}, "eq"),                  # array field
+        ({"v": {"x": 1}}, "eq"),                # object field
+        ({"v": "str"}, "lt"),                   # ordering on string
+        ({"v": True}, "gte"),                   # ordering on bool
+        ({"v": None}, "gt"),                    # ordering on null
+        ({"v": float("inf")}, "eq"),            # non-finite number
+        ({"v": float("nan")}, "ne"),            # non-finite number
+        ({"v": float("-inf")}, "lt"),           # non-finite number
+    ],
+)
+def test_filter_data_validation_errors(data, compare):
+    flt = [{"op": "filter", "field": "v", "compare": compare, "value": 1}]
+    with pytest.raises(DataValidationError):
+        engine.apply_transforms(data, flt, "test")
+
+
+def test_filter_parent_not_object():
+    flt = [{"op": "filter", "field": "a.b", "compare": "eq", "value": 1}]
+    with pytest.raises(DataValidationError):
+        engine.apply_transforms({"a": 5}, flt, "test")
+
+
+def test_filter_acts_in_sequence_with_other_ops():
+    # set runs before the filter and the filter sees the new field
+    out = engine.apply_transforms(
+        {"v": 5},
+        [{"op": "set", "field": "kind", "value": "big"},
+         {"op": "filter", "field": "kind", "compare": "eq", "value": "big"}],
+        "test")
+    assert out == {"v": 5, "kind": "big"}
+    # a record dropped by an early filter never reaches later transforms
+    assert engine.apply_transforms(
+        {"v": 1},
+        [{"op": "filter", "field": "v", "compare": "gt", "value": 100},
+         {"op": "drop", "field": "v"}],
+        "test") is None
+
+
+# --------------------------------------------------------------------------
+# Filter transforms: end to end (jsonl)
+# --------------------------------------------------------------------------
+
+
+FILTER_CFG = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: 2
+transforms:
+  - op: filter
+    field: keep
+    compare: eq
+    value: "yes"
+"""
+
+
+def test_filter_run_drops_matching_records(work):
+    rc, out, cp, _ = run_simple(work, [
+        env_record("s", 1, {"keep": "yes", "v": 1}),
+        env_record("s", 2, {"keep": "no", "v": 2}),
+        env_record("s", 3, {"keep": "yes", "v": 3}),
+        env_record("s", 4, {"keep": "no", "v": 4}),
+        env_record("s", 5, {"keep": "yes", "v": 5}),
+    ], cfg_text=FILTER_CFG)
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == [1, 3, 5]
+    assert rows[0] == {"source_id": "s", "event_id": 1, "schema_version": 1,
+                       "data": {"keep": "yes", "v": 1}}
+    # filtered records still count as consumed input records
+    doc = read_checkpoint(cp)
+    assert doc["sources"]["s"]["records"] == 5
+    assert doc["sink_offset"] == out.stat().st_size
+
+
+def test_filter_all_records_filtered(work):
+    rc, out, cp, _ = run_simple(work, [
+        env_record("s", i, {"keep": "no"}) for i in range(3)
+    ], cfg_text=FILTER_CFG)
+    assert rc == 0
+    assert read_jsonl(out) == []
+    assert read_checkpoint(cp)["sources"]["s"]["records"] == 3
+
+
+def test_filtered_records_count_toward_batch(work):
+    # batch_size 2: record 0 is filtered, record 1 survives -> the batch
+    # boundary commits after two *input* records; record 2 then fails, so
+    # exactly the first batch is visible in the checkpoint.
+    cfg = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: 2
+transforms:
+  - op: filter
+    field: keep
+    compare: eq
+    value: "yes"
+  - op: cast
+    field: n
+    type: integer
+"""
+    rc, out, cp, _ = run_simple(work, [
+        env_record("s", 0, {"keep": "no", "n": "0"}),    # filtered
+        env_record("s", 1, {"keep": "yes", "n": "1"}),   # survives, commit
+        env_record("s", 2, {"keep": "yes", "n": "bad"}),  # cast fails
+    ], cfg_text=cfg)
+    assert rc == 3
+    assert [r["event_id"] for r in read_jsonl(out)] == [1]
+    assert read_checkpoint(cp)["sources"]["s"]["records"] == 2
+
+
+def test_filter_does_not_create_schema_versions(work):
+    cfg = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: 10
+transforms:
+  - op: filter
+    field: keep
+    compare: eq
+    value: "yes"
+"""
+    rc, out, cp, _ = run_simple(work, [
+        env_record("s", 1, {"keep": "yes", "a": 1}),
+        # filtered record has a different shape; it must not bump the version
+        env_record("s", 2, {"keep": "no", "a": 1, "extra": True}),
+        env_record("s", 3, {"keep": "yes", "a": 2}),
+        # surviving record with a new shape bumps the version as usual
+        env_record("s", 4, {"keep": "yes", "a": 3, "extra": False}),
+    ], cfg_text=cfg)
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == [1, 3, 4]
+    assert [r["schema_version"] for r in rows] == [1, 1, 2]
+    assert read_checkpoint(cp)["sources"]["s"]["schema_version"] == 2
+
+
+def test_filter_shared_then_source_level(work):
+    # the shared set creates the field the source-level filter checks
+    cfg = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: 5
+    transforms:
+      - op: filter
+        field: kind
+        compare: ne
+        value: junk
+transforms:
+  - op: set
+    field: kind
+    value: junk
+"""
+    rc, out, cp, _ = run_simple(work, [
+        env_record("s", 1, {"v": 1}),
+        env_record("s", 2, {"v": 2}),
+    ], cfg_text=cfg)
+    assert rc == 0
+    assert read_jsonl(out) == []
+    assert read_checkpoint(cp)["sources"]["s"]["records"] == 2
+
+
+def test_filter_error_aborts_run_with_exit_3(work, capsys):
+    rc, out, cp, _ = run_simple(work, [
+        env_record("s", 1, {"keep": "yes"}),
+        env_record("s", 2, {"other": 1}),       # filter field missing
+    ], cfg_text=FILTER_CFG)
+    assert rc == 3
+    err = capsys.readouterr().err
+    assert err.startswith("Error: DataValidationError")
+    # batch_size 2: nothing committed, but the surviving record was written
+    # to the (uncommitted) output tail
+    assert not cp.exists() or read_checkpoint(cp)["sources"]["s"][
+        "records"] == 0
+
+
+def test_filter_replay_no_dupes_no_skips(work):
+    src = work / "s.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(FILTER_CFG.format(src=str(src)), encoding="utf-8")
+    write_jsonl(src, [
+        env_record("s", 1, {"keep": "yes"}),
+        env_record("s", 2, {"keep": "no"}),
+    ])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == [1]
+
+    with open(src, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(env_record("s", 3, {"keep": "no"})) + "\n")
+        fp.write(json.dumps(env_record("s", 4, {"keep": "yes"})) + "\n")
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == [1, 4]
+    assert read_checkpoint(cp)["sources"]["s"]["records"] == 4
+
+    # replaying again is a no-op
+    size = out.stat().st_size
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    assert out.stat().st_size == size
+    assert [r["event_id"] for r in read_jsonl(out)] == [1, 4]
+
+
+def test_filter_replay_after_failure_resumes_filtered_prefix(work):
+    # first run dies on record 2; after repair the replay must not re-emit
+    # record 1 nor skip the filtered record 0's successors
+    cfg = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: 2
+transforms:
+  - op: filter
+    field: keep
+    compare: eq
+    value: "yes"
+  - op: cast
+    field: n
+    type: integer
+"""
+    src = work / "s.jsonl"
+    cfg_path = work / "c.yaml"
+    cfg_path.write_text(cfg.format(src=str(src)), encoding="utf-8")
+    write_jsonl(src, [
+        env_record("s", 0, {"keep": "no", "n": "0"}),
+        env_record("s", 1, {"keep": "yes", "n": "1"}),
+        env_record("s", 2, {"keep": "yes", "n": "bad"}),
+    ])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg_path), "-o", str(out),
+                     "-p", str(cp)]) == 3
+    write_jsonl(src, [
+        env_record("s", 0, {"keep": "no", "n": "0"}),
+        env_record("s", 1, {"keep": "yes", "n": "1"}),
+        env_record("s", 2, {"keep": "yes", "n": "2"}),
+    ])
+    assert cli_main(["replay", "-c", str(cfg_path), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == [1, 2]
+    assert [r["data"]["n"] for r in rows] == [1, 2]
+    assert read_checkpoint(cp)["sources"]["s"]["records"] == 3
+
+
+# --------------------------------------------------------------------------
+# Filter transforms: CSV sources
+# --------------------------------------------------------------------------
+
+
+def test_csv_filter_on_string_field(work):
+    cfg = """
+sources:
+  - id: alpha
+    type: csv
+    path: {src}
+    batch_size: {batch}
+transforms:
+  - op: filter
+    field: kind
+    compare: ne
+    value: skip
+"""
+    rc, out, cp, _ = run_csv(
+        work, "source_id,event_id,kind,v\n"
+              "alpha,1,keep,a\n"
+              "alpha,2,skip,b\n"
+              "alpha,3,keep,c\n", cfg_text=cfg, batch=2)
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == ["1", "3"]
+    assert rows[0]["data"] == {"kind": "keep", "v": "a"}
+    assert read_checkpoint(cp)["sources"]["alpha"]["records"] == 3
+
+
+def test_csv_filter_after_source_level_cast(work):
+    cfg = """
+sources:
+  - id: alpha
+    type: csv
+    path: {src}
+    batch_size: {batch}
+    transforms:
+      - op: cast
+        field: age
+        type: integer
+      - op: filter
+        field: age
+        compare: gte
+        value: 18
+"""
+    rc, out, cp, _ = run_csv(
+        work, "source_id,event_id,age\n"
+              "alpha,1,36\n"
+              "alpha,2,7\n"
+              "alpha,3,18\n", cfg_text=cfg, batch=5)
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == ["1", "3"]
+    assert [r["data"]["age"] for r in rows] == [36, 18]
+    assert read_checkpoint(cp)["sources"]["alpha"]["records"] == 3
+
+
+def test_csv_filter_replay_idempotent(work):
+    cfg = """
+sources:
+  - id: alpha
+    type: csv
+    path: {src}
+    batch_size: {batch}
+transforms:
+  - op: filter
+    field: v
+    compare: eq
+    value: keep
+"""
+    src = work / "s.csv"
+    cfg_path = work / "c.yaml"
+    cfg_path.write_text(cfg.format(src=str(src), batch=2), encoding="utf-8")
+    write_csv(src, "source_id,event_id,v\nalpha,1,keep\nalpha,2,drop\n")
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg_path), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == ["1"]
+    with open(src, "a", encoding="utf-8") as fp:
+        fp.write("alpha,3,keep\n")
+    assert cli_main(["replay", "-c", str(cfg_path), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == ["1", "3"]
+    assert read_checkpoint(cp)["sources"]["alpha"]["records"] == 3

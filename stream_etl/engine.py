@@ -15,6 +15,10 @@ object is emitted::
 
     {"source_id": ..., "event_id": ..., "schema_version": N, "data": {...}}
 
+A ``filter`` transform instead decides whether the record survives: when its
+condition fails the input record is still consumed (it counts toward the
+batch and the committed prefix) but emits no output and no schema change.
+
 Sources are processed in configuration order. Every ``batch_size`` records
 (and at each source boundary) the output is fsynced and the checkpoint is
 atomically replaced. The checkpoint stores the byte offset of the last
@@ -29,7 +33,7 @@ import json
 import os
 import tempfile
 
-from .config import split_path
+from .config import is_finite_number, split_path
 from .errors import (
     CheckpointError,
     DataValidationError,
@@ -167,12 +171,69 @@ def _cast_value(value, target, where):
 
 
 # --------------------------------------------------------------------------
+# Filters
+# --------------------------------------------------------------------------
+
+
+def _scalar_equal(left, right):
+    """JSON scalar equality.
+
+    ``null`` equals only ``null``; strings compare by exact content; booleans
+    equal only booleans; ints and floats compare by numeric value and a
+    boolean is never a number.
+    """
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) \
+            and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    return isinstance(left, str) and isinstance(right, str) and left == right
+
+
+def _filter_matches(data, raw, where):
+    """Evaluate one ``filter`` transform; True keeps the record."""
+    parts = split_path(raw["field"])
+    value = _walk(data, parts, where)
+    if isinstance(value, (dict, list)):
+        raise DataValidationError(
+            "%s: field %r is not a scalar" % (where, _desc(parts)))
+    if isinstance(value, float) and not is_finite_number(value):
+        raise DataValidationError(
+            "%s: field %r is not a finite number" % (where, _desc(parts)))
+    compare = raw["compare"]
+    target = raw["value"]
+    if compare == "eq":
+        return _scalar_equal(value, target)
+    if compare == "ne":
+        return not _scalar_equal(value, target)
+    # Ordering compares accept only finite non-boolean numbers on both
+    # sides; the configured value was validated at load time.
+    if not is_finite_number(value):
+        raise DataValidationError(
+            "%s: compare %r requires a finite numeric field, got %r"
+            % (where, compare, value))
+    if compare == "lt":
+        return value < target
+    if compare == "lte":
+        return value <= target
+    if compare == "gt":
+        return value > target
+    return value >= target
+
+
+# --------------------------------------------------------------------------
 # Transforms
 # --------------------------------------------------------------------------
 
 
 def apply_transforms(data, transforms, where):
-    """Apply transforms in order to ``data`` (mutated in place)."""
+    """Apply transforms in order to ``data`` (mutated in place).
+
+    Returns the transformed data, or ``None`` when a ``filter`` transform
+    drops the record (the input record then produces no output).
+    """
     for raw in transforms:
         op = raw["op"]
         if op == "rename":
@@ -197,6 +258,9 @@ def apply_transforms(data, transforms, where):
             parts = split_path(raw["field"])
             parent, key = _parent_existing(data, parts, where)
             parent[key] = raw["value"]
+        elif op == "filter":
+            if not _filter_matches(data, raw, where):
+                return None
         else:  # cast
             parts = split_path(raw["field"])
             parent, key = _parent_and_key(data, parts, where)
@@ -881,7 +945,14 @@ def _emit_record(spec, state, config, sink, source_id, event_id, payload,
     data = apply_transforms(payload, config.transforms, where)
     # Source-level transforms run after the shared ones, in their own
     # configured order.
-    data = apply_transforms(data, spec["transforms"], where)
+    if data is not None:
+        data = apply_transforms(data, spec["transforms"], where)
+    # A filtered-out record is still consumed: it counts toward the batch
+    # and the committed input prefix, it just produces no output record and
+    # no schema change.
+    state.records += 1
+    if data is None:
+        return
     state.note_schema(schema_fingerprint(data))
     record = {
         "source_id": source_id,
@@ -890,12 +961,12 @@ def _emit_record(spec, state, config, sink, source_id, event_id, payload,
         "data": data,
     }
     _write_record(sink, record)
-    state.records += 1
 
 
 def _process_jsonl(spec, state, config, sink, commit, pending, fp, hasher):
     boundary = state.offset
-    # Every committed jsonl line produced exactly one record.
+    # state.records counts every consumed input line (filtered or not), so
+    # it doubles as the number of lines already committed.
     line_number = state.records
     while True:
         try:
