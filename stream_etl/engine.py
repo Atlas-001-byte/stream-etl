@@ -19,19 +19,31 @@ A ``filter`` transform instead decides whether the record survives: when its
 condition fails the input record is still consumed (it counts toward the
 batch and the committed prefix) but emits no output and no schema change.
 
+A source may set ``dedup_window`` to a positive integer N. Then, after
+envelope validation and before any transform, the record's ``event_id`` is
+looked up among the source's previous N-1 consumed records using JSON scalar
+equality. A duplicate is consumed exactly like a filtered record (it counts
+toward the batch and the committed prefix but emits no output and no schema
+change); the first occurrence of an id enters the window even if a filter
+later drops it, so later matching records are still duplicates. N of 1 keeps
+an empty window and never de-duplicates. Windows are per source and never
+interact across sources.
+
 Sources are processed in configuration order. Every ``batch_size`` records
 (and at each source boundary) the output is fsynced and the checkpoint is
 atomically replaced. The checkpoint stores the byte offset of the last
-committed record boundary together with a hash of the input prefix up to it;
-replay verifies that prefix is unchanged and the file has not shrunk,
-truncates any uncommitted tail of the output using the sink byte offset,
-then continues, so records are never duplicated or skipped.
+committed record boundary together with a hash of the input prefix up to it
+and, for de-duplicating sources, the complete sliding window of recent
+event ids; replay verifies that prefix is unchanged and the file has not
+shrunk, truncates any uncommitted tail of the output using the sink byte
+offset, then continues, so records are never duplicated or skipped.
 """
 
 import hashlib
 import json
 import os
 import tempfile
+from collections import deque
 
 from .config import is_finite_number, split_path
 from .errors import (
@@ -313,6 +325,11 @@ def schema_fingerprint(value):
 class SourceState:
     def __init__(self, spec):
         self.spec = spec
+        # None means de-duplication is disabled; otherwise N (positive int)
+        # and a queue of the event ids of the last N-1 consumed records,
+        # oldest first.
+        self.dedup_window = spec.get("dedup_window")
+        self.dedup_keys = deque()
         self.offset = 0
         self.input_hash = EMPTY_PREFIX_HASH
         self.records = 0
@@ -324,6 +341,35 @@ class SourceState:
             self.schema_version += 1
             self.schema_fingerprint = fp
 
+    # -- bounded de-duplication ------------------------------------------
+
+    def is_duplicate(self, event_id):
+        """True when ``event_id`` matches one of the last N-1 records.
+
+        Disabled sources (no ``dedup_window``) and N of 1 (an empty history)
+        never match. Comparison uses the same JSON scalar equality as
+        filters.
+        """
+        if self.dedup_window is None:
+            return False
+        for past in self.dedup_keys:
+            if _scalar_equal(event_id, past):
+                return True
+        return False
+
+    def observe(self, event_id):
+        """Slide the window over one just-consumed input record.
+
+        Every consumed input record -- first occurrence, duplicate or
+        filtered-out -- shifts the window, so the window always holds the
+        last N-1 *consumed* records.
+        """
+        if self.dedup_window is None:
+            return
+        self.dedup_keys.append(event_id)
+        if len(self.dedup_keys) >= self.dedup_window:
+            self.dedup_keys.popleft()
+
     def to_json(self):
         return {
             "path": self.spec["path"],
@@ -332,6 +378,8 @@ class SourceState:
             "records": self.records,
             "schema_version": self.schema_version,
             "schema_fingerprint": self.schema_fingerprint,
+            "dedup_window": self.dedup_window,
+            "dedup_keys": list(self.dedup_keys),
         }
 
     @classmethod
@@ -384,7 +432,70 @@ class SourceState:
         state.records = raw["records"]
         state.schema_version = raw["schema_version"]
         state.schema_fingerprint = fp
+        state._load_dedup_state(spec, raw)
         return state
+
+    def _load_dedup_state(self, spec, raw):
+        """Validate and restore the sliding window from checkpoint data."""
+        configured = spec.get("dedup_window")
+        has_window_field = "dedup_window" in raw
+        has_keys_field = "dedup_keys" in raw
+        saved_window = raw.get("dedup_window")
+        saved_keys = raw.get("dedup_keys")
+
+        if configured is None:
+            # Checkpoints written before de-duplication existed carry
+            # neither field; checkpoints written by this code carry an
+            # explicit null/empty window. Anything else means the window
+            # state does not match the configuration.
+            if has_window_field and saved_window is not None:
+                raise CheckpointError(
+                    "checkpoint dedup_window for source %r does not match "
+                    "the configuration" % spec["id"]
+                )
+            if has_keys_field and saved_keys != []:
+                raise CheckpointError(
+                    "checkpoint dedup state for source %r does not match "
+                    "the configuration" % spec["id"]
+                )
+            return
+
+        if not has_window_field or not has_keys_field:
+            raise CheckpointError(
+                "checkpoint entry for source %r is missing dedup window "
+                "state" % spec["id"]
+            )
+        if (isinstance(saved_window, bool)
+                or not isinstance(saved_window, int)
+                or saved_window != configured):
+            raise CheckpointError(
+                "checkpoint dedup_window for source %r does not match the "
+                "configuration" % spec["id"]
+            )
+        if not isinstance(saved_keys, list):
+            raise CheckpointError(
+                "checkpoint dedup_keys for source %r is invalid"
+                % spec["id"]
+            )
+        for value in saved_keys:
+            # Event ids are JSON scalars (the envelope rejects only
+            # arrays/objects; null is a legal key and matches only null).
+            if value is not None and not isinstance(
+                    value, (bool, int, float, str)):
+                raise CheckpointError(
+                    "checkpoint dedup_keys for source %r contains an "
+                    "invalid event_id" % spec["id"]
+                )
+        # The window is exactly the suffix of the consumed record stream;
+        # its size is therefore fully determined by N and the record count.
+        expected = min(configured - 1, self.records)
+        if len(saved_keys) != expected:
+            raise CheckpointError(
+                "checkpoint dedup window for source %r is inconsistent "
+                "with its record count" % spec["id"]
+            )
+        self.dedup_window = configured
+        self.dedup_keys = deque(saved_keys)
 
 
 class Checkpoint:
@@ -567,7 +678,10 @@ def _extract_envelope(obj, source_id, line_number):
     if not isinstance(obj["source_id"], str) or obj["source_id"] == "":
         raise DataValidationError("%s: source_id must be a non-empty string" % where)
     event_id = obj["event_id"]
-    if event_id is None or isinstance(event_id, (dict, list)):
+    # event_id is any JSON scalar, including null (null only ever matches
+    # null under the de-duplication scalar semantics); arrays and objects
+    # are rejected.
+    if isinstance(event_id, (dict, list)):
         raise DataValidationError("%s: event_id must be a scalar" % where)
     if not isinstance(obj["payload"], dict):
         raise DataValidationError("%s: payload must be a JSON object" % where)
@@ -942,16 +1056,25 @@ def _commit_boundary(state, boundary, hasher, commit):
 
 def _emit_record(spec, state, config, sink, source_id, event_id, payload,
                  where):
-    data = apply_transforms(payload, config.transforms, where)
-    # Source-level transforms run after the shared ones, in their own
-    # configured order.
-    if data is not None:
-        data = apply_transforms(data, spec["transforms"], where)
-    # A filtered-out record is still consumed: it counts toward the batch
-    # and the committed input prefix, it just produces no output record and
-    # no schema change.
+    # De-duplication runs after envelope validation and before any
+    # transform: a duplicate id skips transforms entirely.
+    duplicate = state.is_duplicate(event_id)
+    data = None
+    if not duplicate:
+        data = apply_transforms(payload, config.transforms, where)
+        # Source-level transforms run after the shared ones, in their own
+        # configured order.
+        if data is not None:
+            data = apply_transforms(data, spec["transforms"], where)
+    # Every consumed input record counts toward the batch and the committed
+    # prefix and slides the window -- first occurrence, duplicate and
+    # filtered alike -- so a filtered first occurrence still hides its
+    # successors. Duplicates and filtered records produce no output and no
+    # schema change. (A failing transform raises before this point, so the
+    # uncommitted record is not counted or windowed.)
     state.records += 1
-    if data is None:
+    state.observe(event_id)
+    if duplicate or data is None:
         return
     state.note_schema(schema_fingerprint(data))
     record = {

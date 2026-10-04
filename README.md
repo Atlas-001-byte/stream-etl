@@ -39,6 +39,7 @@ sources:
     type: jsonl           # jsonl（逐行 JSON 对象）或 csv
     path: data/orders.jsonl
     batch_size: 100       # 正整数，每处理这么多条提交一次检查点
+    dedup_window: 32      # 可省略；正整数 N，按最近 N-1 条记录去重
     transforms:            # 可省略；来源级转换，在公共 transforms 之后按序执行
       - op: cast
         field: total
@@ -102,6 +103,36 @@ transforms:                # 可省略；按序执行，对全部 source 生效
   `data` 形状演进。无过滤项时每条输入恰好输出一次；有过滤项时命中的
   记录输出零次、其余恰好一次，replay 依旧不重复、不跳过。
 
+### 有界去重（dedup_window）
+
+每个 source 可配置正整数 `dedup_window: N`。配置后，以该记录的
+`event_id` 为键，查看该 source 当前记录**之前最近 N-1 条已消费输入
+记录**；键相等即判为重复：
+
+- 比较按 JSON 标量语义，与 `filter` 的 `eq` 完全一致：`null` 只匹配
+  `null`；布尔只匹配同值布尔（布尔不作为数值）；整数与小数按数值相等；
+  字符串按内容精确相等。因此 jsonl 中 `1` 与 `1.0` 视为同一键。
+- 去重判定在记录信封校验**之后、任何转换之前**进行：重复项不执行任何
+  公共/来源级转换，也不经过 `filter`。
+- 首次出现的 `event_id` 继续按「公共转换 → 来源级转换 → filter」的既有
+  顺序处理。
+- 重复项与被 `filter` 命中的记录一样：计入 `batch_size` 与已提交输入
+  前缀，但不输出记录，也不触发 `schema_version` 变化。
+- **即使首次出现的记录随后被 `filter` 丢弃，它仍进入窗口**，窗口内后续
+  同键记录依旧按重复项处理。
+- 窗口按**已消费记录**滑动：每消费一条（首次、重复、被过滤都算）窗口
+  前进一格，因此窗口恒为最近 N-1 条已消费记录的键；超出窗口的旧键老化，
+  之后同键记录重新成为首次。
+- `N` 为 `1` 时历史窗口为空，因此不会去重；缺省（不配置）时完全保持
+  既有行为。
+- 窗口按 source 各自独立，source 之间互不影响；jsonl 与 csv 的去重口径
+  完全一致（csv 的 `event_id` 始终是非空字符串）。
+
+`dedup_window` 取布尔、零、负数、非整数（如 `1.5`）、字符串、`null` 或
+其他类型都是 `ConfigurationError`（退出码 2）。记录的 `event_id` 为数组或
+对象是 `DataValidationError`（退出码 3）；`null` 是合法的标量键（只匹配
+`null`）。
+
 ## 记录格式（JSON Lines）
 
 输入每行一个 JSON 对象，至少包含：
@@ -144,13 +175,25 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
 ## 断点与恢复
 
 检查点按逻辑记录边界记录每个 source 的进度：`offset` 为最后已提交记录
-结束处的字节偏移，`input_hash` 为输入字节前缀 `[0:offset]` 的 SHA-256。
+结束处的字节偏移，`input_hash` 为输入字节前缀 `[0:offset]` 的 SHA-256；
+配置了 `dedup_window` 的 source 还在检查点中保存完整的当前滑动窗口
+（`dedup_window` 与有序的 `dedup_keys`）以及当前位置。
 
 - `run` 要求 `--output` 与 `--checkpoint` 均不存在；`replay` 要求两者
   均存在。
 - replay 先校验每个 source 的已提交输入前缀哈希一致且文件未变短，否则
   报告 `CheckpointError`（退出码 4）；随后截断 output 中超过已提交偏移
   的未提交尾部，再从最后已提交批次之后的下一条记录继续，不重复、不跳过。
+  去重窗口随已提交边界恢复，因此 replay 在截断未提交输出后继续处理，得到
+  的保留记录与顺序与一次连续运行完全相同；反复 replay 且无新输入时结果
+  确定（输出与检查点字节不变）。
+- 未配置 `dedup_window` 时检查点中的窗口状态为空（`dedup_window: null`、
+  `dedup_keys: []`），并与去重特性出现之前写出的旧检查点兼容：旧检查点
+  缺少这两个字段也能正常恢复。配置了去重的 source 若检查点缺少或写坏窗口
+  状态、窗口与配置不一致，或窗口长度与已提交记录数无法对应，都是
+  `CheckpointError`（退出码 4）。
+- `dedup_window` 属于配置的一部分并进入配置指纹：新增、删除或改变它会使
+  旧检查点不可恢复（`CheckpointError`）。
 - 对 csv 源，进度定位于逻辑记录边界，因此跨物理行的记录也能精确恢复；
 - 无新记录时文件结果确定，可反复 replay。
 
@@ -160,9 +203,9 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
 
 | 类型 | 退出码 | 触发场景 |
 | --- | --- | --- |
-| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径、过滤配置非法 |
-| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败、过滤条件无法求值 |
-| `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、已提交前缀改变或输入变短 |
+| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径、过滤配置非法、`dedup_window` 非正整数 |
+| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败、过滤条件无法求值、`event_id` 为数组或对象 |
+| `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、已提交前缀改变或输入变短、去重窗口状态缺失/写坏/与配置或记录数不一致 |
 | `SourceError` | 5 | 输入不可读 |
 | `SinkError` | 5 | 输出或检查点不可写 |
 
