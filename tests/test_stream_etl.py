@@ -974,3 +974,230 @@ def test_binary_error_prefix_and_code(work):
     )
     assert proc.returncode == 2
     assert proc.stderr.startswith("Error: ConfigurationError")
+
+
+# --------------------------------------------------------------------------
+# Per-source transforms
+# --------------------------------------------------------------------------
+
+
+PER_SOURCE_CFG = """
+sources:
+  - id: a
+    type: jsonl
+    path: {a}
+    batch_size: 2
+    transforms:
+      - op: cast
+        field: age
+        type: integer
+      - op: set
+        field: tag
+        value: from-a
+  - id: b
+    type: jsonl
+    path: {b}
+    batch_size: 2
+transforms:
+  - op: set
+    field: common
+    value: "yes"
+"""
+
+
+def make_two_source_config(work, yaml_text):
+    a = work / "a.jsonl"
+    b = work / "b.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(yaml_text.format(a=str(a), b=str(b)), encoding="utf-8")
+    return cfg, a, b
+
+
+def test_config_source_transforms_parsed():
+    config = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n    transforms:\n      - op: drop\n"
+        "        field: tmp\n"
+    )
+    assert config.sources[0]["transforms"] == [
+        {"op": "drop", "field": "tmp"}
+    ]
+    # a source without its own transforms normalises to an empty list
+    config = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n"
+    )
+    assert config.sources[0]["transforms"] == []
+
+
+@pytest.mark.parametrize(
+    "snippet,needle",
+    [
+        ("    transforms: nope\n", "list"),
+        ("    transforms:\n      - field: x\n", "missing 'op'"),
+        ("    transforms:\n      - op: frobnicate\n", "unknown operation"),
+        ("    transforms:\n      - op: drop\n        field: x\n"
+         "        extra: 1\n", "unknown keys"),
+        ("    transforms:\n      - op: drop\n        field: .bad\n", "path"),
+        ("    transforms:\n      - op: cast\n        field: v\n"
+         "        type: float\n", "cast"),
+        ("    transforms:\n      - op: set\n        field: v\n"
+         "        value:\n          k: 1\n", "scalar"),
+        ("    transforms:\n      - op: rename\n        from: a\n", "'to'"),
+    ],
+)
+def test_config_source_transform_errors(snippet, needle):
+    yaml_text = (
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n" + snippet
+    )
+    with pytest.raises(ConfigurationError) as exc:
+        parse_config_text(yaml_text)
+    assert needle in str(exc.value)
+
+
+def test_source_transforms_order_and_isolation(work):
+    cfg, a, b = make_two_source_config(work, PER_SOURCE_CFG)
+    write_jsonl(a, [env_record("a", 1, {"age": "36", "name": "Ada"})])
+    write_jsonl(b, [env_record("b", 1, {"age": "40", "name": "Bo"})])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    rc = cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 0
+    rows = read_jsonl(out)
+    # source a: common set runs, then its own cast + set
+    assert rows[0]["data"] == {
+        "age": 36, "name": "Ada", "common": "yes", "tag": "from-a",
+    }
+    # source b: only the common transform applies; age stays a string
+    assert rows[1]["data"] == {"age": "40", "name": "Bo", "common": "yes"}
+
+
+def test_source_transforms_run_after_common(work):
+    # the source-level transform sees the field created by the common one
+    cfg_text = """
+sources:
+  - id: s
+    type: jsonl
+    path: {a}
+    batch_size: 5
+    transforms:
+      - op: rename
+        from: common
+        to: renamed
+transforms:
+  - op: set
+    field: common
+    value: v
+"""
+    cfg, a, _ = make_two_source_config(work, cfg_text)
+    write_jsonl(a, [env_record("s", 1, {"x": 1})])
+    write_jsonl(work / "b.jsonl", [])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    rc = cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 0
+    assert read_jsonl(out)[0]["data"] == {"x": 1, "renamed": "v"}
+
+
+def test_source_transforms_schema_version_independent(work):
+    cfg, a, b = make_two_source_config(work, PER_SOURCE_CFG)
+    write_jsonl(a, [
+        env_record("a", 1, {"age": "1"}),
+        env_record("a", 2, {"age": "2", "extra": True}),  # shape change
+        env_record("a", 3, {"age": "3", "extra": False}),  # values only
+    ])
+    write_jsonl(b, [
+        env_record("b", 1, {"age": "9"}),
+        env_record("b", 2, {"age": "8"}),
+    ])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    assert [r["schema_version"] for r in rows] == [1, 2, 2, 1, 1]
+    doc = read_checkpoint(cp)
+    assert doc["sources"]["a"]["schema_version"] == 2
+    assert doc["sources"]["b"]["schema_version"] == 1
+
+
+def test_source_transform_cast_failure_skips_batch(work):
+    cfg, a, b = make_two_source_config(work, PER_SOURCE_CFG)
+    write_jsonl(a, [
+        env_record("a", 1, {"age": "1"}),
+        env_record("a", 2, {"age": "2"}),
+        env_record("a", 3, {"age": "bad"}),  # source-level cast fails
+    ])
+    write_jsonl(b, [env_record("b", 1, {"age": "7"})])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    rc = cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 3
+    # the batch containing the failing record is not committed
+    rows = read_jsonl(out)
+    assert [(r["source_id"], r["event_id"]) for r in rows] == [("a", 1),
+                                                               ("a", 2)]
+    assert read_checkpoint(cp)["sources"]["a"]["records"] == 2
+
+    # repair the input and replay: no duplicates, no skips
+    write_jsonl(a, [
+        env_record("a", 1, {"age": "1"}),
+        env_record("a", 2, {"age": "2"}),
+        env_record("a", 3, {"age": "3"}),
+    ])
+    rc = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [(r["source_id"], r["event_id"]) for r in rows] == [
+        ("a", 1), ("a", 2), ("a", 3), ("b", 1),
+    ]
+    assert rows[2]["data"]["age"] == 3
+    assert rows[3]["data"]["age"] == "7"  # source b has no cast
+
+
+def test_source_transform_missing_path_is_data_error(work):
+    cfg, a, b = make_two_source_config(work, PER_SOURCE_CFG)
+    write_jsonl(a, [env_record("a", 1, {"name": "no-age"})])
+    write_jsonl(b, [])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    rc = cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 3
+    assert read_jsonl(out) == []
+
+
+def test_source_transforms_in_config_fingerprint(work):
+    cfg, a, b = make_two_source_config(work, PER_SOURCE_CFG)
+    write_jsonl(a, [env_record("a", 1, {"age": "1"})])
+    write_jsonl(b, [])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+
+    # same sources and common transforms, different source-level transforms
+    changed = PER_SOURCE_CFG.replace("type: integer", "type: number")
+    cfg.write_text(changed.format(a=str(a), b=str(b)), encoding="utf-8")
+    rc = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 4
+
+
+def test_source_transforms_replay_continues(work):
+    cfg, a, b = make_two_source_config(work, PER_SOURCE_CFG)
+    write_jsonl(a, [env_record("a", i, {"age": str(i)}) for i in range(3)])
+    write_jsonl(b, [env_record("b", 1, {"age": "9"})])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+    assert len(read_jsonl(out)) == 4
+
+    with open(a, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(env_record("a", 3, {"age": "3"})) + "\n")
+    with open(b, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(env_record("b", 2, {"age": "8"})) + "\n")
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    # replay appends per source in configuration order: the new record for
+    # source a lands after the previously committed output, then source b's
+    assert [(r["source_id"], r["event_id"]) for r in rows] == [
+        ("a", 0), ("a", 1), ("a", 2), ("b", 1), ("a", 3), ("b", 2),
+    ]
+    assert rows[4]["data"]["tag"] == "from-a"
+    assert "tag" not in rows[5]["data"]
+    doc = read_checkpoint(cp)
+    assert doc["sources"]["a"]["records"] == 4
+    assert doc["sources"]["b"]["records"] == 2
+    assert doc["sink_offset"] == out.stat().st_size

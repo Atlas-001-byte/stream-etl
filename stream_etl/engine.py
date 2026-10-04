@@ -1,8 +1,9 @@
 """The ETL engine: run, replay, transforms, schema evolution, checkpoints.
 
 For every input JSON object the engine reads ``source_id`` / ``event_id`` /
-``payload``, applies the configured transforms to the payload in order, and
-emits one output object::
+``payload``, applies the configured transforms to the payload — the common
+``transforms`` first, then the source's own ``transforms`` in their
+configured order — and emits one output object::
 
     {"source_id": ..., "event_id": ..., "schema_version": N, "data": {...}}
 
@@ -517,6 +518,8 @@ def _process(config, states, sink, checkpoint_path):
     counts = {}
     for spec, state in zip(config.sources, states):
         emitted = 0
+        # Common transforms first, then this source's own transforms.
+        transforms = config.transforms + spec.get("transforms", [])
         try:
             fp = open(spec["path"], "rb")
         except OSError as exc:
@@ -561,7 +564,7 @@ def _process(config, states, sink, checkpoint_path):
                         "%s: source_id %r does not match configured source"
                         % (where, source_id)
                     )
-                data = apply_transforms(payload, config.transforms, where)
+                data = apply_transforms(payload, transforms, where)
                 state.note_schema(schema_fingerprint(data))
                 record = {
                     "source_id": source_id,

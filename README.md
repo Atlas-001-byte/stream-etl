@@ -39,7 +39,11 @@ sources:
     type: jsonl           # 目前仅支持逐行 JSON 对象的 jsonl
     path: data/orders.jsonl
     batch_size: 100       # 正整数，每处理这么多条提交一次检查点
-transforms:                # 可省略；按序执行
+    transforms:           # 可省略；仅作用于该 source，在公共 transforms 之后执行
+      - op: cast
+        field: total
+        type: number
+transforms:                # 可省略；按序执行，作用于全部 source
   - op: rename
     from: amount
     to: total
@@ -52,6 +56,11 @@ transforms:                # 可省略；按序执行
     field: total
     type: number          # string | integer | number | boolean
 ```
+
+每个 source 可省略或新增自己的 `transforms`（元素与公共转换相同：
+`rename`、`drop`、`set`、`cast`）。未配置时行为与之前一致；配置后先执行
+公共转换，再按自身顺序执行来源级转换。来源级转换同样进入配置指纹，
+检查点不会由不同转换配置恢复。
 
 字段路径为点分路径（如 `a.b.c`），支持嵌套 payload：
 

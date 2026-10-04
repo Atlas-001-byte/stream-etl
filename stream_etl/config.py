@@ -7,12 +7,17 @@ A configuration is a YAML mapping with two keys::
         type: jsonl
         path: <path to a JSON Lines file>
         batch_size: <positive integer>
+        transforms:           # optional, per-source; run after the common ones
+          - op: rename | drop | set | cast
+            ...
     transforms:
       - op: rename | drop | set | cast
         ...
 
 Only these keys are recognised; anything else is a ConfigurationError so a
-typo cannot silently change behaviour.
+typo cannot silently change behaviour. A source without its own ``transforms``
+behaves exactly as before; when present, the common transforms run first and
+the source-level ones afterwards, in their configured order.
 """
 
 import hashlib
@@ -27,6 +32,7 @@ SUPPORTED_SOURCE_TYPES = ("jsonl",)
 TRANSFORM_OPS = ("rename", "drop", "set", "cast")
 TOP_LEVEL_KEYS = ("sources", "transforms")
 SOURCE_KEYS = ("id", "type", "path", "batch_size")
+SOURCE_OPTIONAL_KEYS = ("transforms",)
 
 
 def split_path(path):
@@ -46,8 +52,8 @@ def _require_mapping(value, what):
         raise ConfigurationError("%s must be a mapping" % what)
 
 
-def _validate_transform(raw, index):
-    where = "transforms[%d]" % index
+def _validate_transform(raw, index, prefix="transforms"):
+    where = "%s[%d]" % (prefix, index)
     if not isinstance(raw, dict):
         raise ConfigurationError("%s must be a mapping" % where)
     if "op" not in raw:
@@ -107,7 +113,7 @@ def _validate_source(raw, index, seen_ids):
         raise ConfigurationError(
             "%s is incomplete, missing: %s" % (where, ", ".join(missing))
         )
-    extra = set(raw) - set(SOURCE_KEYS)
+    extra = set(raw) - set(SOURCE_KEYS) - set(SOURCE_OPTIONAL_KEYS)
     if extra:
         raise ConfigurationError(
             "%s has unknown keys: %s" % (where, ", ".join(sorted(extra)))
@@ -127,8 +133,21 @@ def _validate_source(raw, index, seen_ids):
         raise ConfigurationError(
             "%s.batch_size must be a positive integer" % where
         )
+    raw_transforms = raw.get("transforms", [])
+    if not isinstance(raw_transforms, list):
+        raise ConfigurationError("%s.transforms must be a list" % where)
+    transforms = [
+        _validate_transform(item, j, prefix="%s.transforms" % where)
+        for j, item in enumerate(raw_transforms)
+    ]
     seen_ids.add(sid)
-    return {"id": sid, "type": stype, "path": path, "batch_size": batch}
+    return {
+        "id": sid,
+        "type": stype,
+        "path": path,
+        "batch_size": batch,
+        "transforms": transforms,
+    }
 
 
 class Config:
