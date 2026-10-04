@@ -26,6 +26,8 @@ bin/stream-etl replay --config config.yaml --output out.jsonl --checkpoint cp.js
 - `run`：全新运行。`--output` 与 `--checkpoint` 都必须尚不存在。
 - `replay`：断点重放。`--output` 与 `--checkpoint` 都必须已存在；从最后一个
   已提交批次之后继续，先截断输出中未提交的尾部，再追加记录，不重复、不跳过。
+  已提交输入前缀必须逐字节一致且输入文件不得变短，否则报
+  `CheckpointError`（退出码 4）。
 
 成功时 stdout 不输出任何记录，退出码为 0，输出文件与检查点均存在。
 
@@ -36,7 +38,7 @@ bin/stream-etl replay --config config.yaml --output out.jsonl --checkpoint cp.js
 ```yaml
 sources:
   - id: orders            # 唯一非空 id
-    type: jsonl           # 目前仅支持逐行 JSON 对象的 jsonl
+    type: jsonl           # jsonl：逐行 JSON 对象；csv：见下文「CSV 源」
     path: data/orders.jsonl
     batch_size: 100       # 正整数，每处理这么多条提交一次检查点
     transforms:            # 可省略；来源级转换，在公共 transforms 之后按序执行
@@ -92,6 +94,26 @@ transforms:                # 可省略；按序执行，对全部 source 生效
   `schema_version` 单调递增；值变化本身不产生新版本。旧记录不回写。
 - 每 `batch_size` 条以及每个 source 结束时刷盘并原子替换检查点。
 
+## CSV 源
+
+`type: csv` 的 source 沿用 `id`、`path`、`batch_size`、`transforms`，不增加
+配置键，可与 jsonl source 混用并按配置顺序处理。
+
+- 文件为 UTF-8，可带 BOM（BOM 只允许出现在文件开头）。
+- 字段以逗号分隔，可用双引号包裹，引号内以 `""` 表示一个字面双引号；
+  记录以 LF 或 CRLF 结束，引号内允许换行，因此一条逻辑记录可跨多个
+  物理行。
+- 首个逻辑记录是表头：列名必须唯一且非空，且必须包含 `source_id` 与
+  `event_id` 两个控制列；其余列按顺序组成扁平 payload，控制列不进入
+  `data`。
+- 每条数据记录输出一条既有格式记录：`source_id` 必须匹配所属 source，
+  `event_id` 必须非空，空单元格保留为空字符串。
+- 重复或空表头、缺少必需列、空逻辑记录、列数不一致、引号未闭合、
+  无效 UTF-8 均为 `DataValidationError`（退出码 3），当前记录及未满
+  批次不提交，已提交前缀不变。
+- 检查点记录定位到逻辑记录边界；replay 从最后已提交批次后的下一条
+  逻辑记录继续。
+
 ## 错误与退出码
 
 错误输出到 stderr，形如 `Error: <类型>: <细节>`：
@@ -99,8 +121,8 @@ transforms:                # 可省略；按序执行，对全部 source 生效
 | 类型 | 退出码 | 触发场景 |
 | --- | --- | --- |
 | `ConfigurationError` | 2 | 配置缺失/非法、source 不完整、未知操作、非法路径 |
-| `DataValidationError` | 3 | 记录缺 `source_id`/`event_id`/`payload`、路径不存在、cast 失败 |
-| `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、无法恢复 |
+| `DataValidationError` | 3 | 记录缺 `source_id`/`event_id`/`payload`、路径不存在、cast 失败、CSV 格式错误 |
+| `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、已提交输入前缀变化、无法恢复 |
 | `SourceError` | 5 | 输入不可读 |
 | `SinkError` | 5 | 输出或检查点不可写 |
 

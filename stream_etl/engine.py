@@ -1,23 +1,28 @@
 """The ETL engine: run, replay, transforms, schema evolution, checkpoints.
 
-For every input JSON object the engine reads ``source_id`` / ``event_id`` /
-``payload``, applies the configured transforms to the payload in order, and
-emits one output object::
+For every input record (a JSON object per line for ``jsonl`` sources, a
+logical row for ``csv`` sources) the engine reads ``source_id`` /
+``event_id`` and the payload, applies the configured transforms to the
+payload in order, and emits one output object::
 
     {"source_id": ..., "event_id": ..., "schema_version": N, "data": {...}}
 
 Sources are processed in configuration order. Every ``batch_size`` records
 for a source (and at each source boundary) the output is fsynced and the
-checkpoint is atomically replaced. Replay truncates any uncommitted tail of
-the output using the byte offset stored in the checkpoint, then continues, so
-records are never duplicated or skipped.
+checkpoint is atomically replaced. The checkpoint stores, per source, the
+byte offset of the next logical record and the SHA-256 of the committed
+input prefix. Replay verifies that prefix, truncates any uncommitted tail
+of the output using the byte offset stored in the checkpoint, then
+continues, so records are never duplicated or skipped.
 """
 
+import hashlib
 import json
 import os
 import tempfile
 
 from .config import split_path
+from .csv_source import iter_csv_records, prepare_csv_header
 from .errors import (
     CheckpointError,
     DataValidationError,
@@ -27,6 +32,7 @@ from .errors import (
 
 CHECKPOINT_VERSION = 1
 ENCODING = "utf-8"
+EMPTY_INPUT_DIGEST = hashlib.sha256(b"").hexdigest()
 
 
 # --------------------------------------------------------------------------
@@ -239,11 +245,23 @@ class SourceState:
         self.records = 0
         self.schema_version = 0
         self.schema_fingerprint = None
+        # SHA-256 (hex) of the committed input prefix; ``_hasher`` is the
+        # running hash armed once the prefix has been verified.
+        self.input_digest = EMPTY_INPUT_DIGEST
+        self._hasher = None
 
     def note_schema(self, fp):
         if fp != self.schema_fingerprint:
             self.schema_version += 1
             self.schema_fingerprint = fp
+
+    def arm_hasher(self, hasher):
+        self._hasher = hasher
+
+    def note_bytes(self, data):
+        if self._hasher is None:
+            self._hasher = hashlib.sha256()
+        self._hasher.update(data)
 
     def to_json(self):
         return {
@@ -252,6 +270,9 @@ class SourceState:
             "records": self.records,
             "schema_version": self.schema_version,
             "schema_fingerprint": self.schema_fingerprint,
+            "input_digest": (self._hasher.hexdigest()
+                             if self._hasher is not None
+                             else self.input_digest),
         }
 
     @classmethod
@@ -261,7 +282,7 @@ class SourceState:
             raise CheckpointError("checkpoint entry for source %r is invalid"
                                   % spec["id"])
         required = ("path", "offset", "records", "schema_version",
-                    "schema_fingerprint")
+                    "schema_fingerprint", "input_digest")
         for key in required:
             if key not in raw:
                 raise CheckpointError(
@@ -286,10 +307,17 @@ class SourceState:
                 "checkpoint schema_fingerprint for source %r is invalid"
                 % spec["id"]
             )
+        digest = raw["input_digest"]
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise CheckpointError(
+                "checkpoint input_digest for source %r is invalid"
+                % spec["id"]
+            )
         state.offset = raw["offset"]
         state.records = raw["records"]
         state.schema_version = raw["schema_version"]
         state.schema_fingerprint = fp
+        state.input_digest = digest
         return state
 
 
@@ -505,6 +533,79 @@ def _count_lines_before(path, offset):
         raise SourceError("cannot read %s: %s" % (path, exc))
 
 
+def _verify_input_prefix(fp, spec, state):
+    """The committed input prefix must be byte-identical to what the
+    checkpoint recorded; arm the running digest for the new records."""
+    hasher = hashlib.sha256()
+    remaining = state.offset
+    fp.seek(0)
+    while remaining > 0:
+        try:
+            chunk = fp.read(min(65536, remaining))
+        except OSError as exc:
+            raise SourceError("cannot read %s: %s" % (spec["path"], exc))
+        if not chunk:
+            break
+        hasher.update(chunk)
+        remaining -= len(chunk)
+    if hasher.hexdigest() != state.input_digest:
+        raise CheckpointError(
+            "input %s committed prefix changed; cannot recover"
+            % spec["path"]
+        )
+    state.arm_hasher(hasher)
+
+
+def _jsonl_records(fp, spec, state):
+    """Yield (where, source_id, event_id, payload) for each remaining line."""
+    fp.seek(state.offset)
+    line_number = _count_lines_before(spec["path"], state.offset)
+    while True:
+        try:
+            raw_line = fp.readline()
+        except OSError as exc:
+            raise SourceError("cannot read %s: %s" % (spec["path"], exc))
+        if not raw_line:
+            return
+        state.offset += len(raw_line)
+        state.note_bytes(raw_line)
+        line_number += 1
+        try:
+            text = raw_line.decode(ENCODING)
+        except UnicodeDecodeError:
+            raise DataValidationError(
+                "source %r line %d: malformed JSON"
+                % (spec["id"], line_number)
+            )
+        # Every line of a jsonl source is a JSON object; blank or
+        # whitespace-only lines are records that fail validation.
+        where = "source %r line %d" % (spec["id"], line_number)
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            raise DataValidationError("%s: malformed JSON" % where)
+        source_id, event_id, payload = _extract_envelope(
+            obj, spec["id"], line_number
+        )
+        if source_id != spec["id"]:
+            raise DataValidationError(
+                "%s: source_id %r does not match configured source"
+                % (where, source_id)
+            )
+        yield where, source_id, event_id, payload
+
+
+def _source_records(fp, spec, state):
+    """Record iterator for the source type, positioned after the committed
+    prefix (for csv: after the header's logical record boundary)."""
+    if spec["type"] == "csv":
+        header = prepare_csv_header(fp, spec, state)
+        if header is None:
+            return iter(())
+        return iter_csv_records(fp, spec, state, header)
+    return _jsonl_records(fp, spec, state)
+
+
 def _process(config, states, sink, checkpoint_path):
     """Process every source from its current offset; commit per batch."""
     pending = 0
@@ -528,39 +629,9 @@ def _process(config, states, sink, checkpoint_path):
                     "input %s is shorter than the committed offset; "
                     "cannot recover" % spec["path"]
                 )
-            fp.seek(state.offset)
-            line_number = _count_lines_before(spec["path"], state.offset)
-            while True:
-                try:
-                    raw_line = fp.readline()
-                except OSError as exc:
-                    raise SourceError("cannot read %s: %s" % (spec["path"], exc))
-                if not raw_line:
-                    break
-                state.offset += len(raw_line)
-                line_number += 1
-                try:
-                    text = raw_line.decode(ENCODING)
-                except UnicodeDecodeError:
-                    raise DataValidationError(
-                        "source %r line %d: malformed JSON"
-                        % (spec["id"], line_number)
-                    )
-                # Every line of a jsonl source is a JSON object; blank or
-                # whitespace-only lines are records that fail validation.
-                where = "source %r line %d" % (spec["id"], line_number)
-                try:
-                    obj = json.loads(text)
-                except json.JSONDecodeError:
-                    raise DataValidationError("%s: malformed JSON" % where)
-                source_id, event_id, payload = _extract_envelope(
-                    obj, spec["id"], line_number
-                )
-                if source_id != spec["id"]:
-                    raise DataValidationError(
-                        "%s: source_id %r does not match configured source"
-                        % (where, source_id)
-                    )
+            _verify_input_prefix(fp, spec, state)
+            records = _source_records(fp, spec, state)
+            for where, source_id, event_id, payload in records:
                 data = apply_transforms(payload, config.transforms, where)
                 # Source-level transforms run after the shared ones, in
                 # their own configured order.

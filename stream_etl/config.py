@@ -4,8 +4,8 @@ A configuration is a YAML mapping with two keys::
 
     sources:
       - id: <unique string>
-        type: jsonl
-        path: <path to a JSON Lines file>
+        type: jsonl | csv
+        path: <path to a JSON Lines or CSV file>
         batch_size: <positive integer>
         transforms:           # optional, source-level; run after the
           - op: ...           # shared top-level transforms
@@ -25,7 +25,7 @@ from . import yaml_lite
 from .errors import ConfigurationError
 
 CAST_TYPES = ("string", "integer", "number", "boolean")
-SUPPORTED_SOURCE_TYPES = ("jsonl",)
+SUPPORTED_SOURCE_TYPES = ("jsonl", "csv")
 TRANSFORM_OPS = ("rename", "drop", "set", "cast")
 TOP_LEVEL_KEYS = ("sources", "transforms")
 SOURCE_REQUIRED_KEYS = ("id", "type", "path", "batch_size")
@@ -122,7 +122,8 @@ def _validate_source(raw, index, seen_ids):
         raise ConfigurationError("duplicate source id %r" % sid)
     if stype not in SUPPORTED_SOURCE_TYPES:
         raise ConfigurationError(
-            "%s has unsupported type %r (expected jsonl)" % (where, stype)
+            "%s has unsupported type %r (expected one of: %s)"
+            % (where, stype, ", ".join(SUPPORTED_SOURCE_TYPES))
         )
     if not isinstance(path, str) or path == "":
         raise ConfigurationError("%s.path must be a non-empty string" % where)

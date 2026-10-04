@@ -165,7 +165,7 @@ def test_config_minimal(tmp_path):
             "batch_size",
         ),
         (
-            "sources:\n  - id: a\n    type: csv\n    path: x\n"
+            "sources:\n  - id: a\n    type: tsv\n    path: x\n"
             "    batch_size: 1\n",
             "type",
         ),
@@ -1224,3 +1224,285 @@ def test_source_transforms_in_config_fingerprint(work, capsys):
     rc = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
     assert rc == 4
     assert "different configuration" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# CSV sources
+# --------------------------------------------------------------------------
+
+
+CSV_CFG = """
+sources:
+  - id: c
+    type: csv
+    path: {src}
+    batch_size: 2
+"""
+
+
+def write_csv(path, text):
+    with open(path, "wb") as fp:
+        fp.write(text.encode("utf-8"))
+
+
+def run_csv(work, csv_text, cfg_text=CSV_CFG, extra_cfg=""):
+    src = work / "c.csv"
+    cfg = work / "c.yaml"
+    cfg.write_text(cfg_text.format(src=str(src)) + extra_cfg, encoding="utf-8")
+    write_csv(src, csv_text)
+    out, cp = work / "o.jsonl", work / "cp.json"
+    rc = cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    return rc, out, cp, cfg, src
+
+
+def test_config_csv_type_accepted():
+    config = parse_config_text(
+        "sources:\n  - id: s\n    type: csv\n    path: /tmp/x.csv\n"
+        "    batch_size: 1\n"
+    )
+    assert config.sources[0]["type"] == "csv"
+    assert config.sources[0]["transforms"] == []
+
+
+def test_csv_happy_path_bom_crlf_quoting(work):
+    rc, out, cp, _, _ = run_csv(
+        work,
+        "﻿source_id,event_id,name,note\r\n"
+        "c,e1,Alice,\"hello, world\"\n"
+        "c,e2,\"Bob \"\"B\"\"\",\"line1\nline2\"\r\n"
+        "c,e3,,\n",
+    )
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == ["e1", "e2", "e3"]
+    assert rows[0]["data"] == {"name": "Alice", "note": "hello, world"}
+    assert rows[1]["data"] == {"name": 'Bob "B"', "note": "line1\nline2"}
+    # empty cells stay empty strings; control columns never enter data
+    assert rows[2]["data"] == {"name": "", "note": ""}
+    assert [r["schema_version"] for r in rows] == [1, 1, 1]
+    doc = read_checkpoint(cp)
+    assert doc["sources"]["c"]["records"] == 3
+    assert doc["sink_offset"] == out.stat().st_size
+
+
+def test_csv_empty_file_and_header_only(work):
+    for i, text in enumerate(("", "﻿", "source_id,event_id,a\n")):
+        sub = work / str(i)
+        sub.mkdir()
+        rc, out, cp, _, _ = run_csv(sub, text)
+        assert rc == 0
+        assert read_jsonl(out) == []
+
+
+@pytest.mark.parametrize(
+    "csv_text,needle",
+    [
+        ("source_id,source_id,event_id\n", "duplicate"),
+        ("source_id,,event_id\n", "empty column"),
+        ("source_id,name\nc,e1,x\n", "missing required column"),
+        ("event_id,source_id\ne1,c\n", None),  # valid: order irrelevant
+        ("source_id,event_id\n\n", "empty logical record"),
+        ("source_id,event_id,a\nc,e1\n", "expected 3 columns, got 2"),
+        ("source_id,event_id\nc,e1,x\n", "expected 2 columns, got 3"),
+        ('source_id,event_id\nc,"unclosed\n', "unterminated"),
+        ("source_id,event_id\nx,e1\n", "does not match"),
+        ("source_id,event_id\nc,\n", "event_id"),
+        ("source_id,event_id\n﻿c,e1\n", "BOM"),
+    ],
+)
+def test_csv_validation_errors(work, capsys, csv_text, needle):
+    rc, out, cp, _, _ = run_csv(work, csv_text)
+    if needle is None:
+        assert rc == 0
+        return
+    assert rc == 3
+    err = capsys.readouterr().err
+    assert err.startswith("Error: DataValidationError: ")
+    assert needle in err
+
+
+def test_csv_invalid_utf8(work, capsys):
+    src = work / "c.csv"
+    cfg = work / "c.yaml"
+    cfg.write_text(CSV_CFG.format(src=str(src)), encoding="utf-8")
+    with open(src, "wb") as fp:
+        fp.write(b"source_id,event_id,x\nc,e1,\xff\xfe\n")
+    rc = cli_main(["run", "-c", str(cfg), "-o", str(work / "o"),
+                   "-p", str(work / "c")])
+    assert rc == 3
+    assert "UTF-8" in capsys.readouterr().err
+
+
+def test_csv_transforms_and_schema_version(work):
+    extra = ("transforms:\n  - op: cast\n    field: n\n    type: integer\n")
+    rc, out, cp, _, _ = run_csv(
+        work,
+        "source_id,event_id,n,keep\n"
+        "c,1,1,a\n"
+        "c,2,2,b\n"   # value change only: no new version
+        "c,3,3,c\n",
+        extra_cfg=extra,
+    )
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["data"]["n"] for r in rows] == [1, 2, 3]
+    assert all(isinstance(r["data"]["n"], int) for r in rows)
+    assert [r["schema_version"] for r in rows] == [1, 1, 1]
+
+
+def test_csv_failed_record_leaves_no_partial_commit(work, capsys):
+    # batch_size 2: records 1,2 commit; record 3 is malformed, its batch
+    # (and the record itself) must not be committed.
+    rc, out, cp, cfg, src = run_csv(
+        work,
+        "source_id,event_id,a\n"
+        "c,1,x\n"
+        "c,2,y\n"
+        "c,3,z,extra\n",
+    )
+    assert rc == 3
+    assert [r["event_id"] for r in read_jsonl(out)] == ["1", "2"]
+    assert read_checkpoint(cp)["sources"]["c"]["records"] == 2
+
+    # repair the input and replay: continue at the failed logical record
+    write_csv(src, "source_id,event_id,a\nc,1,x\nc,2,y\nc,3,z\n")
+    rc = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == ["1", "2", "3"]
+    assert read_checkpoint(cp)["sources"]["c"]["records"] == 3
+
+
+def test_csv_replay_appends_and_is_idempotent(work):
+    rc, out, cp, cfg, src = run_csv(
+        work, "source_id,event_id,a\nc,1,x\nc,2,y\n"
+    )
+    assert rc == 0
+    with open(src, "a", encoding="utf-8") as fp:
+        fp.write('c,3,"multi\nline"\nc,4,z\n')
+    rc = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == ["1", "2", "3", "4"]
+    assert rows[2]["data"] == {"a": "multi\nline"}
+
+    size = out.stat().st_size
+    rc = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 0
+    assert out.stat().st_size == size
+    assert len(read_jsonl(out)) == 4
+
+
+def test_csv_replay_truncates_uncommitted_tail(work):
+    rc, out, cp, cfg, src = run_csv(
+        work, "source_id,event_id,a\nc,1,x\nc,2,y\n"
+    )
+    assert rc == 0
+    with open(out, "ab") as fp:
+        fp.write(b'{"source_id":"c","event_id":"ghost","schema_version":9,'
+                 b'"data":{}}\n')
+    with open(src, "a", encoding="utf-8") as fp:
+        fp.write("c,3,z\n")
+    rc = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == ["1", "2", "3"]
+    assert read_checkpoint(cp)["sink_offset"] == out.stat().st_size
+
+
+def test_csv_replay_rejects_changed_prefix(work, capsys):
+    rc, out, cp, cfg, src = run_csv(
+        work, "source_id,event_id,a\nc,1,x\nc,2,y\n"
+    )
+    assert rc == 0
+    # rewrite a committed byte, keeping the file length identical
+    write_csv(src, "source_id,event_id,a\nc,1,q\nc,2,y\nc,3,z\n")
+    rc = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 4
+    assert "cannot recover" in capsys.readouterr().err
+
+
+def test_csv_replay_rejects_shrunk_input(work, capsys):
+    rc, out, cp, cfg, src = run_csv(
+        work, "source_id,event_id,a\nc,1,x\nc,2,y\n"
+    )
+    assert rc == 0
+    write_csv(src, "source_id,event_id\n")
+    rc = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 4
+    assert "cannot recover" in capsys.readouterr().err
+
+
+MIXED_CFG = """
+sources:
+  - id: c
+    type: csv
+    path: {c}
+    batch_size: 2
+  - id: j
+    type: jsonl
+    path: {j}
+    batch_size: 2
+transforms:
+  - op: set
+    field: seen
+    value: ok
+"""
+
+
+def test_csv_and_jsonl_sources_mixed_in_order(work):
+    c = work / "c.csv"
+    j = work / "j.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(MIXED_CFG.format(c=str(c), j=str(j)), encoding="utf-8")
+    write_csv(c, "source_id,event_id,k\nc,1,a\nc,2,b\n")
+    write_jsonl(j, [env_record("j", 1, {"k": "x"}),
+                    env_record("j", 2, {"k": "y"})])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    assert [(r["source_id"], r["event_id"]) for r in rows] == [
+        ("c", "1"), ("c", "2"), ("j", 1), ("j", 2),
+    ]
+    assert rows[0]["data"] == {"k": "a", "seen": "ok"}
+    assert rows[2]["data"] == {"k": "x", "seen": "ok"}
+
+    # append to both inputs; replay resumes each source independently
+    with open(c, "a", encoding="utf-8") as fp:
+        fp.write("c,3,d\n")
+    with open(j, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(env_record("j", 3, {"k": "z"})) + "\n")
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    assert [(r["source_id"], r["event_id"]) for r in rows] == [
+        ("c", "1"), ("c", "2"), ("j", 1), ("j", 2), ("c", "3"), ("j", 3),
+    ]
+    doc = read_checkpoint(cp)
+    assert doc["sources"]["c"]["records"] == 3
+    assert doc["sources"]["j"]["records"] == 3
+
+
+def test_csv_source_level_transforms(work):
+    cfg_text = """
+sources:
+  - id: c
+    type: csv
+    path: {src}
+    batch_size: 5
+    transforms:
+      - op: cast
+        field: total
+        type: number
+transforms:
+  - op: rename
+    from: amount
+    to: total
+"""
+    rc, out, cp, _, _ = run_csv(
+        work, "source_id,event_id,amount\nc,1,10.5\nc,2,2\n",
+        cfg_text=cfg_text,
+    )
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["data"] for r in rows] == [{"total": 10.5}, {"total": 2.0}]
+    assert [r["schema_version"] for r in rows] == [1, 1]
