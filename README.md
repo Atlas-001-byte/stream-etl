@@ -40,6 +40,9 @@ sources:
     path: data/orders.jsonl
     batch_size: 100       # 正整数，每处理这么多条提交一次检查点
     dedup_window: 100     # 可省略；正整数 N，按 event_id 对最近 N-1 条去重
+    event_time: meta.ts   # 可省略；三键必须同时配置，指向转换前 payload 的点分路径
+    watermark_delay: 5    # 可省略；与 event_time 同一刻度的有限非负数值
+    late_policy: drop     # 可省略；drop 或 error
     transforms:            # 可省略；来源级转换，在公共 transforms 之后按序执行
       - op: cast
         field: total
@@ -159,6 +162,39 @@ transforms:                # 可省略；按序执行，对全部 source 生效
 - 配置 `dedup_window` 会进入配置指纹，改动它会使旧检查点不可恢复；
   未配置时配置指纹与旧版逐字节一致，既有检查点可正常 replay。
 
+### 事件时间水位线（event_time / watermark_delay / late_policy）
+
+每个 source 可同时配置 `event_time`、`watermark_delay`、`late_policy`
+三个键（必须同时出现，缺少任意一个都是 `ConfigurationError`），用于按
+事件时间处理迟到数据：
+
+- `event_time` 是指向**转换前** payload 的点分路径；`watermark_delay`
+  是与事件时间同一数值刻度上的有限非负数值（整数或小数）；
+  `late_policy` 只接受 `drop` 或 `error`。路径非法、类型或取值越界、
+  含未知键都是 `ConfigurationError`（退出码 2）；三键均进入配置指纹。
+- 启用后每个 source 独立维护已见非迟到记录的**最大事件时间**，水位线为
+  `最大事件时间 - watermark_delay`。判定发生在信封校验之后、去重与任何
+  转换之前，且使用记录进入**之前**的水位线：`event_time` 严格早于水位线
+  才算迟到，等于水位线不迟到，首条记录（尚无水位线）不迟到。
+- 每条非迟到记录的 `event_time` 随后参与最大值更新——即使该记录之后被
+  `dedup_window` 判重、被 `filter` 丢弃，或因 `explode` 空数组产生零条
+  输出。
+- 记录转换前 payload 中的 `event_time` 路径必须存在且为有限的非布尔
+  数值；路径缺失、父路径不是对象，或值为 `null`、字符串、布尔、数组、
+  对象、NaN、无穷，都是 `DataValidationError`（退出码 3），当前批次不
+  提交。注意 CSV 源的 payload 全是字符串，配置水位线后每条记录都会因此
+  报错。
+- `late_policy: drop`：迟到记录仍被消费——计入 `batch_size` 与已提交
+  输入前缀，并滑入去重窗口——但不产生输出、不引发 `schema_version`
+  变化、不抬高最大事件时间。
+- `late_policy: error`：迟到记录返回 `DataValidationError`（退出码 3），
+  当前批次及其后的结果不提交。
+- 最大事件时间与水位线随每个 source 的已提交边界持久化（检查点版本
+  提升为 4），replay 恢复后继续判定；状态缺失、损坏、类型错误、水位线
+  与最大值/延迟不一致，或与配置不一致，都是 `CheckpointError`
+  （退出码 4）。未配置水位线的 source 行为完全不变，版本 2/3 的旧检查点
+  仍可正常 replay。
+
 ## 记录格式（JSON Lines）
 
 输入每行一个 JSON 对象，至少包含：
@@ -205,20 +241,24 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
 结束处的字节偏移，`input_hash` 为输入字节前缀 `[0:offset]` 的 SHA-256。
 配置了 `dedup_window` 的 source 还会在每个已提交边界保存完整滑动窗口
 （`dedup_window` 与 `dedup_keys`），因此窗口随批次持久化、崩溃后可精确
-恢复；这会把检查点版本提升为 3，未配置去重的检查点仍为版本 2。
+恢复；这会把检查点版本提升为 3，未配置去重的检查点仍为版本 2。配置了
+水位线的 source 还会保存 `event_time`、`watermark_delay`、`late_policy`
+与 `max_event_time`、`watermark`，检查点版本提升为 4。
 
 - `run` 要求 `--output` 与 `--checkpoint` 均不存在；`replay` 要求两者
   均存在。
 - replay 先校验每个 source 的已提交输入前缀哈希一致且文件未变短，否则
   报告 `CheckpointError`（退出码 4）；随后截断 output 中超过已提交偏移
   的未提交尾部，再从最后已提交批次之后的下一条记录继续，不重复、不跳过。
-  去重窗口随已提交边界恢复，因此 replay 截断未提交输出后继续处理，得到
-  与一次性连续运行完全相同的保留记录与顺序；反复 replay 而无新输入时
-  结果确定。
+  去重窗口与水位线（最大事件时间）随已提交边界恢复，因此 replay 截断
+  未提交输出后继续处理，得到与一次性连续运行完全相同的保留记录与顺序；
+  反复 replay 而无新输入时结果确定。
 - 对 csv 源，进度定位于逻辑记录边界，因此跨物理行的记录也能精确恢复；
 - 检查点缺少或写坏去重窗口状态、保存的窗口与当前配置不一致（如
   `dedup_window` 被改动）、窗口长度与记录数矛盾，或版本 2 检查点配合
-  配置了去重的配置，都是 `CheckpointError`（退出码 4）；
+  配置了去重的配置，都是 `CheckpointError`（退出码 4）；水位线状态
+  （`max_event_time` / `watermark` 等）缺失、损坏、与配置或记录数不一致，
+  或版本 2/3 检查点配合配置了水位线的配置，同样是 `CheckpointError`；
 - 无新记录时文件结果确定，可反复 replay。
 
 ## 错误与退出码
@@ -227,9 +267,9 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
 
 | 类型 | 退出码 | 触发场景 |
 | --- | --- | --- |
-| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径、过滤或 explode 配置非法、`dedup_window` 非正整数 |
-| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败、过滤条件无法求值、explode 目标非数组/元素非对象/键冲突、`event_id` 为数组或对象 |
-| `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、已提交前缀改变或输入变短、去重窗口状态缺失/损坏/与配置或记录数不一致 |
+| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径、过滤或 explode 配置非法、`dedup_window` 非正整数、水位线三键不全或取值非法 |
+| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败、过滤条件无法求值、explode 目标非数组/元素非对象/键冲突、`event_id` 为数组或对象、`event_time` 缺失或非法、`late_policy: error` 下记录迟到 |
+| `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、已提交前缀改变或输入变短、去重窗口或水位线状态缺失/损坏/与配置或记录数不一致 |
 | `SourceError` | 5 | 输入不可读 |
 | `SinkError` | 5 | 输出或检查点不可写 |
 

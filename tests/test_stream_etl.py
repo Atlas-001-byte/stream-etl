@@ -3206,3 +3206,672 @@ def test_explode_csv_string_field_is_data_error(work, capsys):
     err = capsys.readouterr().err
     assert err.startswith("Error: DataValidationError")
     assert "not an array" in err
+
+
+# --------------------------------------------------------------------------
+# Event-time watermarks: configuration
+# --------------------------------------------------------------------------
+
+
+def test_config_watermark_accepted():
+    config = parse_config_text(
+        "sources:\n"
+        "  - id: s\n"
+        "    type: jsonl\n"
+        "    path: /tmp/x\n"
+        "    batch_size: 1\n"
+        "    event_time: meta.ts\n"
+        "    watermark_delay: 2.5\n"
+        "    late_policy: drop\n"
+    )
+    src = config.sources[0]
+    assert src["event_time"] == "meta.ts"
+    assert src["watermark_delay"] == 2.5
+    assert src["late_policy"] == "drop"
+    assert set(src) == {
+        "id", "type", "path", "batch_size", "transforms",
+        "event_time", "watermark_delay", "late_policy"}
+
+
+def test_config_without_watermark_has_no_keys():
+    # The keys are absent (not normalised to None) so the fingerprint stays
+    # byte-identical to the pre-watermark configuration layout.
+    config = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n"
+    )
+    src = config.sources[0]
+    assert "event_time" not in src
+    assert "watermark_delay" not in src
+    assert "late_policy" not in src
+
+
+@pytest.mark.parametrize("keys", [
+    "    event_time: ts\n",
+    "    watermark_delay: 2\n",
+    "    late_policy: drop\n",
+    "    event_time: ts\n    watermark_delay: 2\n",
+    "    event_time: ts\n    late_policy: drop\n",
+    "    watermark_delay: 2\n    late_policy: drop\n",
+])
+def test_config_watermark_partial_triple_rejected(keys):
+    with pytest.raises(ConfigurationError) as exc:
+        parse_config_text(
+            "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+            "    batch_size: 1\n" + keys
+        )
+    assert "together" in str(exc.value)
+
+
+@pytest.mark.parametrize("value", ['""', "a..b", ".a", "a.", "1", "null"])
+def test_config_watermark_event_time_path_invalid(value):
+    with pytest.raises(ConfigurationError):
+        parse_config_text(
+            "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+            "    batch_size: 1\n    event_time: %s\n"
+            "    watermark_delay: 2\n    late_policy: drop\n" % value
+        )
+
+
+@pytest.mark.parametrize("value", ["true", "-1", "-0.5", '"2"', "null"])
+def test_config_watermark_delay_invalid(value):
+    with pytest.raises(ConfigurationError) as exc:
+        parse_config_text(
+            "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+            "    batch_size: 1\n    event_time: ts\n"
+            "    watermark_delay: %s\n    late_policy: drop\n" % value
+        )
+    assert "watermark_delay" in str(exc.value)
+
+
+@pytest.mark.parametrize("value", ["0", "2", "2.5"])
+def test_config_watermark_delay_non_negative_number_accepted(value):
+    config = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n    event_time: ts\n"
+        "    watermark_delay: %s\n    late_policy: error\n" % value
+    )
+    assert config.sources[0]["watermark_delay"] in (0, 2, 2.5)
+
+
+@pytest.mark.parametrize("value", ['"keep"', '"DROP"', "1", "null", "true"])
+def test_config_watermark_late_policy_invalid(value):
+    with pytest.raises(ConfigurationError) as exc:
+        parse_config_text(
+            "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+            "    batch_size: 1\n    event_time: ts\n"
+            "    watermark_delay: 2\n    late_policy: %s\n" % value
+        )
+    assert "late_policy" in str(exc.value)
+
+
+def test_config_watermark_enters_fingerprint():
+    without = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n"
+    )
+    with_wm = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n    event_time: ts\n"
+        "    watermark_delay: 2\n    late_policy: drop\n"
+    )
+    assert without.fingerprint() != with_wm.fingerprint()
+    # changing any of the three keys also changes the fingerprint
+    other = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n    event_time: ts\n"
+        "    watermark_delay: 3\n    late_policy: drop\n"
+    )
+    assert with_wm.fingerprint() != other.fingerprint()
+
+
+# --------------------------------------------------------------------------
+# Event-time watermarks: state unit semantics
+# --------------------------------------------------------------------------
+
+
+def _watermark_state(delay=3, policy="drop"):
+    from stream_etl.engine import SourceState
+    return SourceState(
+        {"id": "s", "path": "/tmp/x", "transforms": [],
+         "event_time": "ts", "watermark_delay": delay,
+         "late_policy": policy})
+
+
+def test_watermark_first_record_never_late():
+    st = _watermark_state()
+    assert st.watermark() is None
+    assert st.is_late(0) is False
+    assert st.is_late(-100) is False
+    st.note_event_time(10)
+    assert st.watermark() == 7
+
+
+def test_watermark_equal_to_watermark_not_late():
+    st = _watermark_state(delay=3)
+    st.note_event_time(10)
+    assert st.is_late(7) is False        # equal to the watermark: on time
+    assert st.is_late(6.999) is True
+    assert st.is_late(8) is False
+
+
+def test_watermark_max_only_rises():
+    st = _watermark_state()
+    st.note_event_time(10)
+    st.note_event_time(5)
+    assert st.max_event_time == 10
+    st.note_event_time(12)
+    assert st.max_event_time == 12
+    assert st.watermark() == 9
+
+
+def test_watermark_disabled_state():
+    from stream_etl.engine import SourceState
+    st = SourceState({"id": "s", "path": "/tmp/x", "transforms": []})
+    assert st.event_time_parts is None
+    assert st.max_event_time is None
+
+
+# --------------------------------------------------------------------------
+# Event-time watermarks: jsonl end to end
+# --------------------------------------------------------------------------
+
+
+WM_CFG = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: {batch}
+    event_time: {path}
+    watermark_delay: {delay}
+    late_policy: {policy}
+"""
+
+
+def run_watermark(work, rows, delay=3, policy="drop", batch=10, path="ts",
+                  cfg_text=None, extra=""):
+    src = work / "s.jsonl"
+    cfg = work / "c.yaml"
+    template = cfg_text or WM_CFG
+    cfg.write_text(
+        template.format(src=str(src), batch=batch, delay=delay,
+                        policy=policy, path=path) + extra,
+        encoding="utf-8")
+    write_jsonl(src, rows)
+    out, cp = work / "o.jsonl", work / "cp.json"
+    rc = cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    return rc, out, cp, cfg, src
+
+
+def test_watermark_drop_basic(work):
+    rc, out, cp, _, _ = run_watermark(work, [
+        env_record("s", 1, {"ts": 10}),
+        env_record("s", 2, {"ts": 12}),     # max 12, watermark 9
+        env_record("s", 3, {"ts": 8}),      # 8 < 9: late, dropped
+        env_record("s", 4, {"ts": 9}),      # equal to watermark: on time
+        env_record("s", 5, {"ts": 13}),     # max 13, watermark 10
+    ], delay=3)
+    assert rc == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == [1, 2, 4, 5]
+    doc = read_checkpoint(cp)
+    assert doc["version"] == 4
+    src = doc["sources"]["s"]
+    # the late record is consumed: it counts toward the committed prefix
+    assert src["records"] == 5
+    assert src["max_event_time"] == 13
+    assert src["watermark"] == 10
+    assert src["event_time"] == "ts"
+    assert src["watermark_delay"] == 3
+    assert src["late_policy"] == "drop"
+    assert doc["sink_offset"] == out.stat().st_size
+
+
+def test_watermark_late_records_count_toward_batch(work):
+    # batch_size 2; late records still advance the committed boundary.
+    rc, out, cp, _, _ = run_watermark(work, [
+        env_record("s", 1, {"ts": 10}),
+        env_record("s", 2, {"ts": 5}),      # late (wm 7) -> commit after it
+        env_record("s", 3, {"ts": 20}),
+        env_record("s", 4, {"ts": 6}),      # late -> commit after it
+        env_record("s", 5, {"ts": 30}),
+    ], delay=3, batch=2)
+    assert rc == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == [1, 3, 5]
+    assert read_checkpoint(cp)["sources"]["s"]["records"] == 5
+
+
+def test_watermark_drop_does_not_change_schema(work):
+    # A late record carrying a wildly different payload shape must not bump
+    # schema_version, nor prime a shape.
+    rc, out, cp, _, _ = run_watermark(work, [
+        env_record("s", 1, {"ts": 10, "a": 1}),
+        env_record("s", 2, {"ts": 1, "a": 1, "b": [{"x": 1}]}),   # late
+        env_record("s", 3, {"ts": 11, "a": 1}),
+    ], delay=3)
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["schema_version"] for r in rows] == [1, 1]
+    assert read_checkpoint(cp)["sources"]["s"]["schema_version"] == 1
+
+
+def test_watermark_drop_does_not_raise_max(work):
+    rc, out, cp, _, _ = run_watermark(work, [
+        env_record("s", 1, {"ts": 10}),
+        env_record("s", 2, {"ts": 20}),     # max 20, watermark 17
+        env_record("s", 3, {"ts": 15}),     # late: dropped, max stays 20
+        env_record("s", 4, {"ts": 16}),     # still late against 17
+        env_record("s", 5, {"ts": 17}),     # equal to watermark: on time
+    ], delay=3)
+    assert rc == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == [1, 2, 5]
+    doc = read_checkpoint(cp)["sources"]["s"]
+    assert doc["max_event_time"] == 20
+    assert doc["watermark"] == 17
+
+
+def test_watermark_error_policy_rejects_late_record(work, capsys):
+    rc, out, cp, _, _ = run_watermark(work, [
+        env_record("s", 1, {"ts": 10}),
+        env_record("s", 2, {"ts": 20}),     # commit (batch 2), wm 17
+        env_record("s", 3, {"ts": 15}),     # late -> DataValidationError
+        env_record("s", 4, {"ts": 30}),
+    ], delay=3, policy="error", batch=2)
+    assert rc == 3
+    err = capsys.readouterr().err
+    assert err.startswith("Error: DataValidationError")
+    assert "earlier than the watermark" in err
+    # the batch holding the late record (and everything after) never commits
+    assert [r["event_id"] for r in read_jsonl(out)] == [1, 2]
+    doc = read_checkpoint(cp)
+    assert doc["sources"]["s"]["records"] == 2
+    assert doc["sources"]["s"]["max_event_time"] == 20
+
+
+@pytest.mark.parametrize("payload", [
+    {},                     # path missing
+    {"ts": None},
+    {"ts": "10"},
+    {"ts": True},
+    {"ts": [10]},
+    {"ts": {"x": 10}},
+])
+def test_watermark_event_time_invalid_values(work, capsys, payload):
+    rc, _, _, _, _ = run_watermark(work, [env_record("s", 1, payload)])
+    assert rc == 3
+    assert capsys.readouterr().err.startswith("Error: DataValidationError")
+
+
+def test_watermark_event_time_parent_not_object(work, capsys):
+    rc, _, _, _, _ = run_watermark(
+        work, [env_record("s", 1, {"meta": 5})], path="meta.ts")
+    assert rc == 3
+    assert "does not exist" in capsys.readouterr().err
+
+
+def test_watermark_event_time_nan_and_infinity(work, capsys):
+    src = work / "s.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(WM_CFG.format(src=str(src), batch=10, delay=3,
+                                 policy="drop", path="ts"), encoding="utf-8")
+    out, cp = work / "o.jsonl", work / "cp.json"
+    for token in ("NaN", "Infinity", "-Infinity"):
+        src.write_text(
+            '{"source_id":"s","event_id":1,"payload":{"ts":%s}}\n' % token,
+            encoding="utf-8")
+        rc = cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+        assert rc == 3
+        assert capsys.readouterr().err.startswith("Error: DataValidationError")
+        out.unlink()
+        if cp.exists():
+            cp.unlink()
+
+
+def test_watermark_event_time_read_before_transforms(work):
+    # The transform drops the ts field entirely; the event time was already
+    # read from the pre-transform payload, so watermarking still works.
+    rc, out, _, _, _ = run_watermark(work, [
+        env_record("s", 1, {"ts": 10, "v": "a"}),
+        env_record("s", 2, {"ts": 9, "v": "b"}),     # late (wm 10, delay 0)
+        env_record("s", 3, {"ts": 11, "v": "c"}),
+    ], delay=0, extra="transforms:\n  - op: drop\n    field: ts\n")
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == [1, 3]
+    assert all("ts" not in r["data"] for r in rows)
+
+
+def test_watermark_max_updates_despite_filter(work):
+    # A filtered-out record still raises the maximum, making a later record
+    # late that would have been on time otherwise.
+    rc, out, cp, _, _ = run_watermark(work, [
+        env_record("s", 1, {"ts": 10, "keep": "yes"}),
+        env_record("s", 2, {"ts": 20, "keep": "no"}),   # filtered, max 20
+        env_record("s", 3, {"ts": 15, "keep": "yes"}),  # 15 < wm 17: late
+    ], delay=3, extra=(
+        "transforms:\n  - op: filter\n    field: keep\n"
+        '    compare: eq\n    value: "yes"\n'))
+    assert rc == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == [1]
+    doc = read_checkpoint(cp)["sources"]["s"]
+    assert doc["records"] == 3
+    assert doc["max_event_time"] == 20
+
+
+def test_watermark_max_updates_despite_dedup(work):
+    # A duplicate still raises the maximum even though it emits nothing.
+    rc, out, cp, _, _ = run_watermark(work, [
+        env_record("s", 1, {"ts": 10}),
+        env_record("s", 1, {"ts": 20}),     # duplicate, but max 20
+        env_record("s", 2, {"ts": 15}),     # 15 < wm 17: late
+    ], delay=3, cfg_text=(WM_CFG + "    dedup_window: 10\n"))
+    assert rc == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == [1]
+    doc = read_checkpoint(cp)["sources"]["s"]
+    assert doc["records"] == 3
+    assert doc["max_event_time"] == 20
+
+
+def test_watermark_max_updates_despite_empty_explode(work):
+    # An explode over an empty array produces zero branches but the record's
+    # event time still joins the maximum.
+    rc, out, cp, _, _ = run_watermark(work, [
+        env_record("s", 1, {"ts": 10, "items": [{"a": 1}]}),
+        env_record("s", 2, {"ts": 20, "items": []}),    # zero outputs, max 20
+        env_record("s", 3, {"ts": 15, "items": [{"a": 2}]}),  # late
+    ], delay=3, extra="transforms:\n  - op: explode\n    field: items\n")
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == [1]
+    assert rows[0]["data"] == {"ts": 10, "a": 1}
+    assert read_checkpoint(cp)["sources"]["s"]["max_event_time"] == 20
+
+
+def test_watermark_late_record_enters_dedup_window(work):
+    # A late record dropped by the watermark still slides through the dedup
+    # window, so a later on-time record with the same event_id is a duplicate.
+    rc, out, cp, _, _ = run_watermark(work, [
+        env_record("s", 1, {"ts": 10}),
+        env_record("s", 2, {"ts": 20}),     # max 20, wm 17
+        env_record("s", 3, {"ts": 15}),     # late: dropped, key 3 windowed
+        env_record("s", 3, {"ts": 25}),     # on time but duplicate
+        env_record("s", 4, {"ts": 30}),
+    ], delay=3, cfg_text=(
+        WM_CFG + "    dedup_window: 10\n"))
+    assert rc == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == [1, 2, 4]
+    assert read_checkpoint(cp)["sources"]["s"]["records"] == 5
+
+
+def test_watermark_nested_event_time_path(work):
+    rc, out, cp, _, _ = run_watermark(work, [
+        env_record("s", 1, {"meta": {"ts": 10}, "v": 1}),
+        env_record("s", 2, {"meta": {"ts": 8}, "v": 2}),   # late (wm 9)
+        env_record("s", 3, {"meta": {"ts": 9}, "v": 3}),   # equal: on time
+    ], delay=1, path="meta.ts")
+    assert rc == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == [1, 3]
+    assert read_checkpoint(cp)["sources"]["s"]["max_event_time"] == 10
+
+
+def test_watermark_csv_string_event_time_is_data_error(work, capsys):
+    # CSV payloads are flat strings, so a configured event_time path never
+    # holds a number: same data semantics as jsonl, same exit code.
+    src = work / "s.csv"
+    write_csv(src, "source_id,event_id,ts\ns,1,10\n")
+    cfg = work / "c.yaml"
+    cfg.write_text(
+        "sources:\n"
+        "  - id: s\n"
+        "    type: csv\n"
+        "    path: %s\n"
+        "    batch_size: 1\n"
+        "    event_time: ts\n"
+        "    watermark_delay: 3\n"
+        "    late_policy: drop\n" % src,
+        encoding="utf-8",
+    )
+    rc = cli_main(["run", "-c", str(cfg), "-o", str(work / "o"),
+                   "-p", str(work / "cp")])
+    assert rc == 3
+    err = capsys.readouterr().err
+    assert err.startswith("Error: DataValidationError")
+    assert "must hold a finite number" in err
+
+
+def test_watermark_sources_are_isolated(work):
+    a, b = work / "a.jsonl", work / "b.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(
+        "sources:\n"
+        "  - id: a\n    type: jsonl\n    path: %s\n    batch_size: 1\n"
+        "    event_time: ts\n    watermark_delay: 3\n    late_policy: drop\n"
+        "  - id: b\n    type: jsonl\n    path: %s\n    batch_size: 1\n"
+        % (a, b), encoding="utf-8")
+    write_jsonl(a, [
+        env_record("a", 1, {"ts": 10}),
+        env_record("a", 2, {"ts": 5}),      # late for source a
+        env_record("a", 3, {"ts": 20}),
+    ])
+    write_jsonl(b, [
+        env_record("b", 1, {"ts": 10}),
+        env_record("b", 2, {"ts": 5}),      # no watermark: kept
+    ])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    assert [(r["source_id"], r["event_id"]) for r in rows] == [
+        ("a", 1), ("a", 3), ("b", 1), ("b", 2)]
+    doc = read_checkpoint(cp)
+    assert doc["version"] == 4
+    assert doc["sources"]["a"]["max_event_time"] == 20
+    assert "max_event_time" not in doc["sources"]["b"]
+    assert "watermark" not in doc["sources"]["b"]
+
+
+def test_checkpoint_without_watermark_keeps_version_2_and_3(work):
+    # Plain configurations keep writing version 2 and dedup configurations
+    # version 3; neither carries watermark state.
+    rc, _, cp, _ = run_simple(work, [env_record("s", 1, {"a": 1})])
+    assert rc == 0
+    doc = read_checkpoint(cp)
+    assert doc["version"] == 2
+    assert "max_event_time" not in doc["sources"]["s"]
+    seg = work / "dedup"
+    seg.mkdir()
+    rc, _, cp, _, _ = run_dedup(seg, [env_record("s", 1, {"v": 1})], window=3)
+    assert rc == 0
+    doc = read_checkpoint(cp)
+    assert doc["version"] == 3
+    assert "max_event_time" not in doc["sources"]["s"]
+
+
+# --------------------------------------------------------------------------
+# Event-time watermarks: replay equivalence and checkpoint errors
+# --------------------------------------------------------------------------
+
+
+WM_ROWS = [
+    env_record("s", 1, {"ts": 10}),
+    env_record("s", 2, {"ts": 20}),
+    env_record("s", 3, {"ts": 15}),     # late (wm 17)
+    env_record("s", 4, {"ts": 25}),
+    env_record("s", 5, {"ts": 18}),     # late (wm 22)
+    env_record("s", 6, {"ts": 30}),
+]
+
+
+def test_watermark_replay_segmented_matches_continuous(work):
+    # Continuous reference.
+    rc, cont_out, cont_cp, _, _ = run_watermark(work, WM_ROWS, batch=2)
+    assert rc == 0
+    cont_bytes = cont_out.read_bytes()
+    cont_src = read_checkpoint(cont_cp)["sources"]["s"]
+
+    # Segmented: first 3 records committed, then append and replay.
+    seg = work / "seg"
+    seg.mkdir()
+    seg_src = seg / "s.jsonl"
+    seg_cfg = seg / "c.yaml"
+    seg_cfg.write_text(
+        WM_CFG.format(src=str(seg_src), batch=2, delay=3, policy="drop",
+                      path="ts"), encoding="utf-8")
+    write_jsonl(seg_src, WM_ROWS[:3])
+    seg_out, seg_cp = seg / "o.jsonl", seg / "cp.json"
+    assert cli_main(["run", "-c", str(seg_cfg), "-o", str(seg_out),
+                     "-p", str(seg_cp)]) == 0
+    with open(seg_src, "a", encoding="utf-8") as fp:
+        for row in WM_ROWS[3:]:
+            fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+    assert cli_main(["replay", "-c", str(seg_cfg), "-o", str(seg_out),
+                     "-p", str(seg_cp)]) == 0
+    assert seg_out.read_bytes() == cont_bytes
+    seg_state = read_checkpoint(seg_cp)["sources"]["s"]
+    assert seg_state["max_event_time"] == cont_src["max_event_time"] == 30
+    assert seg_state["watermark"] == cont_src["watermark"] == 27
+    assert seg_state["records"] == cont_src["records"] == 6
+
+
+def test_watermark_replay_idempotent_without_new_input(work):
+    rc, out, cp, cfg, _ = run_watermark(work, WM_ROWS, batch=2)
+    assert rc == 0
+    size, cp_bytes = out.stat().st_size, cp.read_bytes()
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    assert out.stat().st_size == size
+    assert cp.read_bytes() == cp_bytes
+
+
+def test_watermark_state_restored_after_failed_batch(work):
+    # Error policy: the third record is late, so the batch spanning records
+    # 3-4 never commits. On replay the watermark must be the committed one.
+    src = work / "s.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(
+        WM_CFG.format(src=str(src), batch=2, delay=3, policy="error",
+                      path="ts"), encoding="utf-8")
+    write_jsonl(src, [
+        env_record("s", 1, {"ts": 10}),
+        env_record("s", 2, {"ts": 20}),
+        env_record("s", 3, {"ts": 15}),     # late (wm 17): run fails
+        env_record("s", 4, {"ts": 30}),
+    ])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 3
+    assert [r["event_id"] for r in read_jsonl(out)] == [1, 2]
+    doc = read_checkpoint(cp)["sources"]["s"]
+    assert doc["records"] == 2
+    assert doc["max_event_time"] == 20
+    assert doc["watermark"] == 17
+
+    # repair the late record and replay: the restored watermark (17, not
+    # one computed from scratch) judges the rewritten records
+    write_jsonl(src, [
+        env_record("s", 1, {"ts": 10}),
+        env_record("s", 2, {"ts": 20}),
+        env_record("s", 3, {"ts": 16}),     # still late against restored wm
+        env_record("s", 4, {"ts": 30}),
+    ])
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 3
+    write_jsonl(src, [
+        env_record("s", 1, {"ts": 10}),
+        env_record("s", 2, {"ts": 20}),
+        env_record("s", 3, {"ts": 18}),     # on time against restored wm
+        env_record("s", 4, {"ts": 30}),
+    ])
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == [1, 2, 3, 4]
+    doc = read_checkpoint(cp)["sources"]["s"]
+    assert doc["records"] == 4
+    assert doc["max_event_time"] == 30
+    assert doc["watermark"] == 27
+
+
+def test_watermark_replay_checkpoint_error_cases(work, capsys):
+    rc, out, cp, cfg, src = run_watermark(work, [
+        env_record("s", 1, {"ts": 10}),
+        env_record("s", 2, {"ts": 20}),
+    ], batch=1)
+    assert rc == 0
+    with open(src, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(env_record("s", 3, {"ts": 30})) + "\n")
+
+    def expect_error(mutator, needle):
+        backup = cp.read_bytes()
+        _mutate_checkpoint(cp, mutator)
+        r = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+        assert r == 4
+        assert needle in capsys.readouterr().err
+        cp.write_bytes(backup)
+
+    expect_error(lambda d: d["sources"]["s"].pop("max_event_time"),
+                 "missing the watermark state")
+    expect_error(lambda d: d["sources"]["s"].pop("watermark"),
+                 "missing the watermark state")
+    expect_error(lambda d: d["sources"]["s"].pop("late_policy"),
+                 "missing the watermark state")
+    expect_error(lambda d: d["sources"]["s"].__setitem__(
+        "max_event_time", "soon"), "max_event_time for source 's' is invalid")
+    expect_error(lambda d: d["sources"]["s"].__setitem__(
+        "watermark", True), "watermark for source 's' is invalid")
+    expect_error(lambda d: d["sources"]["s"].__setitem__(
+        "max_event_time", None), "inconsistent with its record count")
+    expect_error(lambda d: d["sources"]["s"].__setitem__(
+        "watermark", 18), "inconsistent with its max_event_time")
+    expect_error(lambda d: d["sources"]["s"].__setitem__(
+        "event_time", "other"), "differs from the configuration")
+    expect_error(lambda d: d["sources"]["s"].__setitem__(
+        "watermark_delay", 99), "differs from the configuration")
+    expect_error(lambda d: d["sources"]["s"].__setitem__(
+        "late_policy", "error"), "differs from the configuration")
+    expect_error(lambda d: d.__setitem__("version", 2),
+                 "predates event-time watermarks")
+
+
+def test_watermark_state_rejected_for_plain_source(work, capsys):
+    # A checkpoint that carries watermark state for a source whose
+    # configuration has no watermark triple is corrupt.
+    a, b = work / "a.jsonl", work / "b.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(
+        "sources:\n"
+        "  - id: a\n    type: jsonl\n    path: %s\n    batch_size: 1\n"
+        "    event_time: ts\n    watermark_delay: 3\n    late_policy: drop\n"
+        "  - id: b\n    type: jsonl\n    path: %s\n    batch_size: 1\n"
+        % (a, b), encoding="utf-8")
+    write_jsonl(a, [env_record("a", 1, {"ts": 10})])
+    write_jsonl(b, [env_record("b", 1, {"ts": 10})])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+    _mutate_checkpoint(cp, lambda d: d["sources"]["b"].__setitem__(
+        "max_event_time", 10))
+    rc = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 4
+    assert "carries watermark state" in capsys.readouterr().err
+
+
+def test_watermark_old_checkpoint_rejected_with_watermark_config(
+        work, capsys):
+    rc, out, cp, cfg, src = run_watermark(work, [
+        env_record("s", 1, {"ts": 10}),
+    ], batch=1)
+    assert rc == 0
+    _mutate_checkpoint(cp, lambda d: d.__setitem__("version", 3))
+    r = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert r == 4
+    assert "predates event-time watermarks" in capsys.readouterr().err
+
+
+def test_watermark_config_change_invalidates_checkpoint(work, capsys):
+    rc, out, cp, cfg, src = run_watermark(work, [
+        env_record("s", 1, {"ts": 10}),
+    ], batch=1)
+    assert rc == 0
+    cfg.write_text(
+        WM_CFG.format(src=str(src), batch=1, delay=4, policy="drop",
+                      path="ts"), encoding="utf-8")
+    r = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert r == 4
+    assert "different configuration" in capsys.readouterr().err

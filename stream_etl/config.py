@@ -8,6 +8,10 @@ A configuration is a YAML mapping with two keys::
         path: <path to a JSON Lines file or a CSV file>
         batch_size: <positive integer>
         dedup_window: <positive integer, optional>
+        event_time: <dotted path into the pre-transform payload, optional>
+        watermark_delay: <finite non-negative number, optional>
+        late_policy: drop | error (optional; the three watermark keys
+                      must be configured together)
         transforms:           # optional, source-level; run after the
           - op: ...           # shared top-level transforms
     transforms:
@@ -27,12 +31,15 @@ from .errors import ConfigurationError
 
 CAST_TYPES = ("string", "integer", "number", "boolean")
 COMPARE_OPS = ("eq", "ne", "lt", "lte", "gt", "gte")
+LATE_POLICIES = ("drop", "error")
 ORDERING_COMPARES = ("lt", "lte", "gt", "gte")
 SUPPORTED_SOURCE_TYPES = ("jsonl", "csv")
 TRANSFORM_OPS = ("rename", "drop", "set", "cast", "filter", "explode")
 TOP_LEVEL_KEYS = ("sources", "transforms")
 SOURCE_REQUIRED_KEYS = ("id", "type", "path", "batch_size")
-SOURCE_KEYS = SOURCE_REQUIRED_KEYS + ("dedup_window", "transforms")
+WATERMARK_KEYS = ("event_time", "watermark_delay", "late_policy")
+SOURCE_KEYS = SOURCE_REQUIRED_KEYS + ("dedup_window", "transforms") \
+    + WATERMARK_KEYS
 
 
 def split_path(path):
@@ -182,6 +189,30 @@ def _validate_source(raw, index, seen_ids):
         _validate_transform(item, i, prefix)
         for i, item in enumerate(raw_transforms)
     ]
+    # The event-time watermark keys form an all-or-nothing triple: like
+    # dedup_window they only enter the spec when configured, so sources
+    # without them keep a byte-identical configuration fingerprint.
+    present = [k for k in WATERMARK_KEYS if k in raw]
+    if present and len(present) != len(WATERMARK_KEYS):
+        raise ConfigurationError(
+            "%s: %s must be configured together (missing: %s)"
+            % (where, ", ".join(WATERMARK_KEYS),
+               ", ".join(k for k in WATERMARK_KEYS if k not in raw))
+        )
+    if present:
+        split_path(raw["event_time"])
+        delay = raw["watermark_delay"]
+        if not is_finite_number(delay) or delay < 0:
+            raise ConfigurationError(
+                "%s.watermark_delay must be a finite non-negative number"
+                % where
+            )
+        policy = raw["late_policy"]
+        if policy not in LATE_POLICIES:
+            raise ConfigurationError(
+                "%s.late_policy accepts only %s, got %r"
+                % (where, ", ".join(LATE_POLICIES), policy)
+            )
     seen_ids.add(sid)
     spec = {
         "id": sid,
@@ -191,6 +222,9 @@ def _validate_source(raw, index, seen_ids):
     }
     if "dedup_window" in raw:
         spec["dedup_window"] = dedup_window
+    if present:
+        for key in WATERMARK_KEYS:
+            spec[key] = raw[key]
     spec["transforms"] = transforms
     return spec
 

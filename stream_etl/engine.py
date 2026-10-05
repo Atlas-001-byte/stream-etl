@@ -37,6 +37,22 @@ no output and triggers no schema change. ``N == 1`` keeps an empty window, so
 nothing is ever deduplicated; a source without ``dedup_window`` behaves
 exactly as before. Windows are per source and never interact.
 
+A source may instead (or additionally) configure an event-time watermark via
+the triple ``event_time`` / ``watermark_delay`` / ``late_policy``. The source
+then tracks the maximum event time seen so far and judges every record —
+right after envelope validation, before dedup and any transform — against
+the watermark ``max_event_time - watermark_delay`` as it stood *before* the
+record arrived: a record whose ``event_time`` value (a finite non-boolean
+number read from the pre-transform payload) is strictly earlier than that
+watermark is late. ``late_policy: drop`` consumes the late record (it counts
+toward the batch and the committed prefix and slides through the dedup
+window) without emitting output, changing the schema version or raising the
+maximum; ``late_policy: error`` fails the record with a DataValidationError.
+A non-late record's event time joins the maximum even when the record is
+later deduplicated, filtered out or exploded into zero branches. The maximum
+and the watermark are persisted with every committed boundary and restored
+on replay.
+
 Sources are processed in configuration order. Every ``batch_size`` records
 (and at each source boundary) the output is fsynced and the checkpoint is
 atomically replaced. The checkpoint stores the byte offset of the last
@@ -67,6 +83,10 @@ CHECKPOINT_VERSION = 2
 # configurations that set ``dedup_window``; plain configurations keep writing
 # version 2 and old version 2 checkpoints remain replayable against them.
 CHECKPOINT_VERSION_DEDUP = 3
+# Version 4 adds the per-source event-time watermark state. It is only used
+# by configurations that set the watermark triple; configurations without it
+# keep writing versions 2/3 and those checkpoints remain replayable.
+CHECKPOINT_VERSION_WATERMARK = 4
 ENCODING = "utf-8"
 BOM = b"\xef\xbb\xbf"
 EMPTY_PREFIX_HASH = hashlib.sha256(b"").hexdigest()
@@ -430,6 +450,40 @@ class SourceState:
             self.window = None
         else:
             self.window = deque((), maxlen=self.dedup_window - 1)
+        # Event-time watermark state: None/absent when the source does not
+        # configure the watermark triple (legacy behaviour). ``max_event_time``
+        # is the largest event time of any non-late consumed record; the
+        # watermark is that maximum minus ``watermark_delay``.
+        self.event_time_path = spec.get("event_time")
+        if self.event_time_path is None:
+            self.event_time_parts = None
+            self.watermark_delay = None
+            self.late_policy = None
+        else:
+            self.event_time_parts = split_path(self.event_time_path)
+            self.watermark_delay = spec["watermark_delay"]
+            self.late_policy = spec["late_policy"]
+        self.max_event_time = None
+
+    def watermark(self):
+        """Current watermark, or None before the first consumed record."""
+        if self.max_event_time is None:
+            return None
+        return self.max_event_time - self.watermark_delay
+
+    def is_late(self, event_time):
+        """True when ``event_time`` falls before the incoming watermark.
+
+        The first record is never late (no watermark exists yet) and an
+        event time exactly equal to the watermark is not late.
+        """
+        watermark = self.watermark()
+        return watermark is not None and event_time < watermark
+
+    def note_event_time(self, event_time):
+        """Fold one non-late record's event time into the maximum."""
+        if self.max_event_time is None or event_time > self.max_event_time:
+            self.max_event_time = event_time
 
     def note_schema(self, fp):
         if fp != self.schema_fingerprint:
@@ -465,6 +519,12 @@ class SourceState:
         if self.dedup_window is not None:
             doc["dedup_window"] = self.dedup_window
             doc["dedup_keys"] = list(self.window)
+        if self.event_time_path is not None:
+            doc["event_time"] = self.event_time_path
+            doc["watermark_delay"] = self.watermark_delay
+            doc["late_policy"] = self.late_policy
+            doc["max_event_time"] = self.max_event_time
+            doc["watermark"] = self.watermark()
         return doc
 
     @classmethod
@@ -518,7 +578,62 @@ class SourceState:
         state.schema_version = raw["schema_version"]
         state.schema_fingerprint = fp
         state.window = state._restore_window(spec, raw)
+        state._restore_watermark(spec, raw)
         return state
+
+    def _restore_watermark(self, spec, raw):
+        """Validate and rebuild the watermark state from checkpoint data."""
+        configured = spec.get("event_time") is not None
+        has_wm_state = any(
+            key in raw
+            for key in ("event_time", "watermark_delay", "late_policy",
+                        "max_event_time", "watermark")
+        )
+        if not configured:
+            if has_wm_state:
+                raise CheckpointError(
+                    "checkpoint for source %r carries watermark state but "
+                    "the source configures no event_time" % spec["id"]
+                )
+            return
+        for key in ("event_time", "watermark_delay", "late_policy",
+                    "max_event_time", "watermark"):
+            if key not in raw:
+                raise CheckpointError(
+                    "checkpoint for source %r is missing the watermark "
+                    "state %r" % (spec["id"], key)
+                )
+        for key in ("event_time", "watermark_delay", "late_policy"):
+            if raw[key] != spec[key]:
+                raise CheckpointError(
+                    "checkpoint %s for source %r differs from the "
+                    "configuration" % (key, spec["id"])
+                )
+        max_event_time = raw["max_event_time"]
+        watermark = raw["watermark"]
+        for key, value in (("max_event_time", max_event_time),
+                           ("watermark", watermark)):
+            if value is not None and not is_finite_number(value):
+                raise CheckpointError(
+                    "checkpoint %s for source %r is invalid"
+                    % (key, spec["id"])
+                )
+        # The first consumed record is never late, so a source that has
+        # consumed records always has a maximum (and vice versa).
+        if (max_event_time is None) != (self.records == 0):
+            raise CheckpointError(
+                "checkpoint max_event_time for source %r is inconsistent "
+                "with its record count" % spec["id"]
+            )
+        if (watermark is None) != (max_event_time is None) or (
+            max_event_time is not None
+            and watermark != max_event_time - self.watermark_delay
+        ):
+            raise CheckpointError(
+                "checkpoint watermark for source %r is inconsistent with "
+                "its max_event_time and watermark_delay" % spec["id"]
+            )
+        self.max_event_time = max_event_time
 
     def _restore_window(self, spec, raw):
         """Validate and rebuild the dedup window from checkpoint data."""
@@ -587,13 +702,22 @@ class Checkpoint:
         self.sink_offset = sink_offset
 
     def to_json(self):
+        uses_watermark = any(
+            spec.get("event_time") is not None
+            for spec in self.config.sources
+        )
         uses_dedup = any(
             spec.get("dedup_window") is not None
             for spec in self.config.sources
         )
+        if uses_watermark:
+            version = CHECKPOINT_VERSION_WATERMARK
+        elif uses_dedup:
+            version = CHECKPOINT_VERSION_DEDUP
+        else:
+            version = CHECKPOINT_VERSION
         return {
-            "version": CHECKPOINT_VERSION_DEDUP if uses_dedup
-            else CHECKPOINT_VERSION,
+            "version": version,
             "config_fingerprint": self.config.fingerprint(),
             "sink_offset": self.sink_offset,
             "sources": {
@@ -647,14 +771,30 @@ def load_checkpoint(path, config):
     if not isinstance(doc, dict):
         raise CheckpointError("checkpoint %s is corrupt" % path)
     version = doc.get("version")
-    if version not in (CHECKPOINT_VERSION, CHECKPOINT_VERSION_DEDUP):
+    if version not in (CHECKPOINT_VERSION, CHECKPOINT_VERSION_DEDUP,
+                       CHECKPOINT_VERSION_WATERMARK):
         raise CheckpointError("checkpoint version mismatch (expected %d, got %r)"
-                              % (CHECKPOINT_VERSION_DEDUP, version))
+                              % (CHECKPOINT_VERSION_WATERMARK, version))
     if doc.get("config_fingerprint") != config.fingerprint():
         raise CheckpointError("checkpoint was written by a different configuration")
     any_dedup = any(
         spec.get("dedup_window") is not None for spec in config.sources
     )
+    any_watermark = any(
+        spec.get("event_time") is not None for spec in config.sources
+    )
+    # Versions 2/3 predate watermarks, and a version 4 checkpoint must be
+    # backed by at least one watermark-configured source.
+    if version < CHECKPOINT_VERSION_WATERMARK and any_watermark:
+        raise CheckpointError(
+            "checkpoint predates event-time watermarks; cannot recover "
+            "watermark state"
+        )
+    if version == CHECKPOINT_VERSION_WATERMARK and not any_watermark:
+        raise CheckpointError(
+            "checkpoint carries watermark state but the configuration sets "
+            "no event_time"
+        )
     # Version 2 checkpoints predate dedup: they cannot be matched against a
     # configuration that now requires window state; version 3 must be backed
     # by at least one dedup source.
@@ -788,6 +928,20 @@ def _extract_envelope(obj, source_id, line_number):
     if not isinstance(obj["payload"], dict):
         raise DataValidationError("%s: payload must be a JSON object" % where)
     return obj["source_id"], event_id, obj["payload"]
+
+
+def _event_time_value(payload, parts, where):
+    """Read the event time from the pre-transform payload.
+
+    The path must exist (through nested objects) and hold a finite,
+    non-boolean number; anything else is a data error.
+    """
+    value = _walk(payload, parts, where)
+    if not is_finite_number(value):
+        raise DataValidationError(
+            "%s: event_time path %r must hold a finite number, got %r"
+            % (where, _desc(parts), value))
+    return value
 
 
 def _write_record(sink, record):
@@ -1158,6 +1312,27 @@ def _commit_boundary(state, boundary, hasher, commit):
 
 def _emit_record(spec, state, config, sink, source_id, event_id, payload,
                  where):
+    # The watermark check runs right after envelope validation and before
+    # dedup and any transform: the event time is read from the pre-transform
+    # payload and judged against the watermark as it stood before this
+    # record arrived. A late record under ``drop`` is consumed (it counts
+    # toward the batch and the committed prefix and slides through the
+    # dedup window) but emits nothing, changes no schema version and does
+    # not raise the maximum; under ``error`` it fails the batch.
+    if state.event_time_parts is not None:
+        event_time = _event_time_value(payload, state.event_time_parts, where)
+        if state.is_late(event_time):
+            if state.late_policy == "error":
+                raise DataValidationError(
+                    "%s: event_time %r is earlier than the watermark %r"
+                    % (where, event_time, state.watermark()))
+            state.note_event(event_id)
+            state.records += 1
+            return
+        # A non-late record's event time joins the maximum even when the
+        # record is later deduplicated, filtered out or exploded into zero
+        # branches.
+        state.note_event_time(event_time)
     # Dedup runs after the envelope is validated and before any transform:
     # a duplicate is consumed (it counts toward the batch and the committed
     # prefix and slides through the window) but is never transformed or
