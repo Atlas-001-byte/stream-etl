@@ -37,6 +37,26 @@ no output and triggers no schema change. ``N == 1`` keeps an empty window, so
 nothing is ever deduplicated; a source without ``dedup_window`` behaves
 exactly as before. Windows are per source and never interact.
 
+A source may configure the watermark trio ``event_time`` (a dotted path into
+the pre-transform payload), ``watermark_delay`` (a finite non-negative number
+on the same scale) and ``late_policy`` (``drop`` or ``error``); the three
+keys are all-or-nothing. The source then tracks the largest event time seen
+so far and defines its watermark as that maximum minus the delay. Every
+valid record is judged against the watermark *as it was before the record
+entered*: a record whose event time is strictly below the watermark is late
+(equal to the watermark is on time, and a source's first record is never
+late). Only then does the event time join the maximum, and it does so even
+when the record is later removed by ``dedup_window`` or a ``filter``, or an
+``explode`` yields zero branches. A late record is still consumed (it counts
+toward the batch and the committed prefix and slides through the dedup
+window); with ``late_policy: drop`` it produces no output, no schema change
+and no maximum advance, while ``late_policy: error`` raises a
+DataValidationError and the current batch (and everything after it) stays
+uncommitted. The event time must exist in the pre-transform payload and be a
+finite non-boolean number; a missing path, a non-object parent, null, a
+string, boolean, array, object, NaN or infinity are DataValidationError.
+Watermark state, like the dedup window, is per source.
+
 Sources are processed in configuration order. Every ``batch_size`` records
 (and at each source boundary) the output is fsynced and the checkpoint is
 atomically replaced. The checkpoint stores the byte offset of the last
@@ -54,7 +74,7 @@ import os
 import tempfile
 from collections import deque
 
-from .config import is_finite_number, split_path
+from .config import LATE_POLICIES, is_finite_number, split_path
 from .errors import (
     CheckpointError,
     DataValidationError,
@@ -67,6 +87,10 @@ CHECKPOINT_VERSION = 2
 # configurations that set ``dedup_window``; plain configurations keep writing
 # version 2 and old version 2 checkpoints remain replayable against them.
 CHECKPOINT_VERSION_DEDUP = 3
+# Version 4 adds the per-source watermark maximum event time. It is only used
+# by configurations that set the watermark trio; configurations without it
+# keep writing version 2/3 (version 3 when dedup is configured).
+CHECKPOINT_VERSION_WATERMARK = 4
 ENCODING = "utf-8"
 BOM = b"\xef\xbb\xbf"
 EMPTY_PREFIX_HASH = hashlib.sha256(b"").hexdigest()
@@ -430,6 +454,39 @@ class SourceState:
             self.window = None
         else:
             self.window = deque((), maxlen=self.dedup_window - 1)
+        # Watermark settings are present only when the configuration trio is
+        # set. ``max_event_time`` is None until the first on-time record has
+        # updated it; late records (drop policy) never advance the maximum.
+        self.event_time_path = spec.get("event_time")
+        self.watermark_delay = spec.get("watermark_delay")
+        self.late_policy = spec.get("late_policy")
+        self.max_event_time = None
+
+    @property
+    def watermark_enabled(self):
+        return self.event_time_path is not None
+
+    def watermark(self):
+        """Current watermark, or None before any event time was observed."""
+        if self.max_event_time is None:
+            return None
+        return self.max_event_time - self.watermark_delay
+
+    def note_event_time(self, value):
+        """Decide one valid record against the pre-entry watermark.
+
+        Returns ``True`` when the record is late (its event time is strictly
+        below the watermark in effect before it entered). The maximum is
+        updated afterwards only for on-time records: the first record has no
+        watermark and is therefore never late, and an event time equal to the
+        watermark is on time.
+        """
+        mark = self.watermark()
+        late = mark is not None and value < mark
+        if not late:
+            if self.max_event_time is None or value > self.max_event_time:
+                self.max_event_time = value
+        return late
 
     def note_schema(self, fp):
         if fp != self.schema_fingerprint:
@@ -465,6 +522,11 @@ class SourceState:
         if self.dedup_window is not None:
             doc["dedup_window"] = self.dedup_window
             doc["dedup_keys"] = list(self.window)
+        if self.watermark_enabled:
+            doc["event_time"] = self.event_time_path
+            doc["watermark_delay"] = self.watermark_delay
+            doc["late_policy"] = self.late_policy
+            doc["max_event_time"] = self.max_event_time
         return doc
 
     @classmethod
@@ -518,6 +580,7 @@ class SourceState:
         state.schema_version = raw["schema_version"]
         state.schema_fingerprint = fp
         state.window = state._restore_window(spec, raw)
+        state.max_event_time = state._restore_watermark(spec, raw)
         return state
 
     def _restore_window(self, spec, raw):
@@ -579,6 +642,65 @@ class SourceState:
                 )
         return deque(keys, maxlen=capacity)
 
+    def _restore_watermark(self, spec, raw):
+        """Validate and rebuild the watermark maximum from checkpoint data."""
+        has_state = any(key in raw for key in (
+            "event_time", "watermark_delay", "late_policy", "max_event_time"))
+        if "event_time" not in spec:
+            if has_state:
+                raise CheckpointError(
+                    "checkpoint for source %r carries watermark state but "
+                    "the source configures no event_time" % spec["id"]
+                )
+            return None
+        for key in ("event_time", "watermark_delay", "late_policy",
+                    "max_event_time"):
+            if key not in raw:
+                raise CheckpointError(
+                    "checkpoint for source %r is missing watermark state %r"
+                    % (spec["id"], key)
+                )
+        if raw["event_time"] != spec["event_time"]:
+            raise CheckpointError(
+                "checkpoint event_time for source %r differs from the "
+                "configuration" % spec["id"]
+            )
+        delay = raw["watermark_delay"]
+        if not is_finite_number(delay) or delay < 0:
+            raise CheckpointError(
+                "checkpoint watermark_delay for source %r is invalid"
+                % spec["id"]
+            )
+        if delay != spec["watermark_delay"]:
+            raise CheckpointError(
+                "checkpoint watermark_delay for source %r is %r but the "
+                "configuration is %r"
+                % (spec["id"], delay, spec["watermark_delay"])
+            )
+        if raw["late_policy"] not in LATE_POLICIES \
+                or raw["late_policy"] != spec["late_policy"]:
+            raise CheckpointError(
+                "checkpoint late_policy for source %r differs from the "
+                "configuration" % spec["id"]
+            )
+        maximum = raw["max_event_time"]
+        # The first record is never late, so a source that consumed at least
+        # one record always has a finite maximum; None is legitimate only on
+        # a pre-data boundary (e.g. a CSV source committed after its header).
+        if maximum is None:
+            if self.records != 0:
+                raise CheckpointError(
+                    "checkpoint max_event_time for source %r is missing but "
+                    "records were consumed" % spec["id"]
+                )
+            return None
+        if not is_finite_number(maximum):
+            raise CheckpointError(
+                "checkpoint max_event_time for source %r is invalid"
+                % spec["id"]
+            )
+        return maximum
+
 
 class Checkpoint:
     def __init__(self, config, states, sink_offset):
@@ -591,9 +713,16 @@ class Checkpoint:
             spec.get("dedup_window") is not None
             for spec in self.config.sources
         )
+        uses_watermark = any(spec.get("event_time") is not None
+                             for spec in self.config.sources)
+        if uses_watermark:
+            version = CHECKPOINT_VERSION_WATERMARK
+        elif uses_dedup:
+            version = CHECKPOINT_VERSION_DEDUP
+        else:
+            version = CHECKPOINT_VERSION
         return {
-            "version": CHECKPOINT_VERSION_DEDUP if uses_dedup
-            else CHECKPOINT_VERSION,
+            "version": version,
             "config_fingerprint": self.config.fingerprint(),
             "sink_offset": self.sink_offset,
             "sources": {
@@ -647,25 +776,46 @@ def load_checkpoint(path, config):
     if not isinstance(doc, dict):
         raise CheckpointError("checkpoint %s is corrupt" % path)
     version = doc.get("version")
-    if version not in (CHECKPOINT_VERSION, CHECKPOINT_VERSION_DEDUP):
+    if version not in (CHECKPOINT_VERSION, CHECKPOINT_VERSION_DEDUP,
+                       CHECKPOINT_VERSION_WATERMARK):
         raise CheckpointError("checkpoint version mismatch (expected %d, got %r)"
-                              % (CHECKPOINT_VERSION_DEDUP, version))
+                              % (CHECKPOINT_VERSION_WATERMARK, version))
     if doc.get("config_fingerprint") != config.fingerprint():
         raise CheckpointError("checkpoint was written by a different configuration")
     any_dedup = any(
         spec.get("dedup_window") is not None for spec in config.sources
     )
-    # Version 2 checkpoints predate dedup: they cannot be matched against a
-    # configuration that now requires window state; version 3 must be backed
-    # by at least one dedup source.
-    if version == CHECKPOINT_VERSION and any_dedup:
+    any_watermark = any(
+        spec.get("event_time") is not None for spec in config.sources
+    )
+    # Version 2 checkpoints predate dedup and watermarks; version 3
+    # checkpoints carry dedup windows but predate watermarks; only version 4
+    # may back a configuration that tracks watermarks. A version's extra
+    # state must always be backed by at least one source requiring it.
+    if version == CHECKPOINT_VERSION and (any_dedup or any_watermark):
+        if any_watermark:
+            raise CheckpointError(
+                "checkpoint predates watermark support; cannot recover "
+                "watermark state"
+            )
         raise CheckpointError(
             "checkpoint predates dedup_window; cannot recover window state"
         )
-    if version == CHECKPOINT_VERSION_DEDUP and not any_dedup:
+    if version == CHECKPOINT_VERSION_DEDUP:
+        if any_watermark:
+            raise CheckpointError(
+                "checkpoint predates watermark support; cannot recover "
+                "watermark state"
+            )
+        if not any_dedup:
+            raise CheckpointError(
+                "checkpoint carries dedup state but the configuration sets "
+                "no dedup_window"
+            )
+    if version == CHECKPOINT_VERSION_WATERMARK and not any_watermark:
         raise CheckpointError(
-            "checkpoint carries dedup state but the configuration sets no "
-            "dedup_window"
+            "checkpoint carries watermark state but the configuration sets "
+            "no watermark settings"
         )
     sink_offset = doc.get("sink_offset")
     if (isinstance(sink_offset, bool) or not isinstance(sink_offset, int)
@@ -788,6 +938,23 @@ def _extract_envelope(obj, source_id, line_number):
     if not isinstance(obj["payload"], dict):
         raise DataValidationError("%s: payload must be a JSON object" % where)
     return obj["source_id"], event_id, obj["payload"]
+
+
+def _read_event_time(state, payload, where):
+    """Read and validate the configured event time of one record.
+
+    The path is resolved against the pre-transform payload; it must exist
+    through nested objects and the leaf must be a finite non-boolean number.
+    Anything else (missing path, non-object parent, null, string, boolean,
+    array, object, NaN, infinity) is a DataValidationError.
+    """
+    parts = split_path(state.event_time_path)
+    value = _walk(payload, parts, where)
+    if not is_finite_number(value):
+        raise DataValidationError(
+            "%s: event_time path %r must hold a finite non-boolean number, "
+            "got %r" % (where, _desc(parts), value))
+    return value
 
 
 def _write_record(sink, record):
@@ -1158,6 +1325,27 @@ def _commit_boundary(state, boundary, hasher, commit):
 
 def _emit_record(spec, state, config, sink, source_id, event_id, payload,
                  where):
+    # Watermarking runs after envelope validation, before dedup and any
+    # transform. The record is judged against the watermark as it was before
+    # the record entered (the first record is never late; equality is on
+    # time). The event time then joins the per-source maximum even when the
+    # record is later dropped by dedup/filter or an explode emits nothing.
+    if state.watermark_enabled:
+        event_time = _read_event_time(state, payload, where)
+        if state.note_event_time(event_time):
+            # A late record is consumed exactly like a filtered one: it
+            # counts toward the batch and the committed prefix and slides
+            # through the dedup window, but under late_policy: error it
+            # aborts the batch before any state advances past the decision;
+            # under drop it neither emits, changes schema, raises the
+            # maximum, nor is transformed.
+            if state.late_policy == "error":
+                raise DataValidationError(
+                    "%s: event time %r is below the watermark %r"
+                    % (where, event_time, state.watermark()))
+            state.note_event(event_id)
+            state.records += 1
+            return
     # Dedup runs after the envelope is validated and before any transform:
     # a duplicate is consumed (it counts toward the batch and the committed
     # prefix and slides through the window) but is never transformed or

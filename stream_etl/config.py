@@ -8,6 +8,9 @@ A configuration is a YAML mapping with two keys::
         path: <path to a JSON Lines file or a CSV file>
         batch_size: <positive integer>
         dedup_window: <positive integer, optional>
+        event_time: <dotted payload path, optional>      # watermark trio:
+        watermark_delay: <finite non-negative number>    # all three or none
+        late_policy: drop | error
         transforms:           # optional, source-level; run after the
           - op: ...           # shared top-level transforms
     transforms:
@@ -32,7 +35,12 @@ SUPPORTED_SOURCE_TYPES = ("jsonl", "csv")
 TRANSFORM_OPS = ("rename", "drop", "set", "cast", "filter", "explode")
 TOP_LEVEL_KEYS = ("sources", "transforms")
 SOURCE_REQUIRED_KEYS = ("id", "type", "path", "batch_size")
-SOURCE_KEYS = SOURCE_REQUIRED_KEYS + ("dedup_window", "transforms")
+# The watermark trio is all-or-nothing: either all three keys are present
+# (and individually valid) or none of them are.
+WATERMARK_KEYS = ("event_time", "watermark_delay", "late_policy")
+LATE_POLICIES = ("drop", "error")
+SOURCE_KEYS = SOURCE_REQUIRED_KEYS + (
+    "dedup_window", "transforms") + WATERMARK_KEYS
 
 
 def split_path(path):
@@ -133,6 +141,43 @@ def _validate_transform(raw, index, prefix="transforms"):
     return {k: raw[k] for k in raw}
 
 
+def _validate_watermark(raw, where):
+    """Validate the all-or-nothing watermark trio.
+
+    Returns ``None`` when none of the keys are present (the source keeps its
+    legacy behaviour), or a dict with all three validated settings. A partial
+    trio, bad path, non-finite/negative/boolean delay or unknown policy is a
+    ConfigurationError.
+    """
+    present = [key for key in WATERMARK_KEYS if key in raw]
+    if not present:
+        return None
+    if len(present) != len(WATERMARK_KEYS):
+        missing = [key for key in WATERMARK_KEYS if key not in raw]
+        raise ConfigurationError(
+            "%s watermark settings %s must appear together with %s"
+            % (where, ", ".join(sorted(present)), ", ".join(missing))
+        )
+    event_time = raw["event_time"]
+    split_path(event_time)
+    delay = raw["watermark_delay"]
+    if not is_finite_number(delay) or delay < 0:
+        raise ConfigurationError(
+            "%s.watermark_delay must be a finite non-negative number" % where
+        )
+    policy = raw["late_policy"]
+    if policy not in LATE_POLICIES:
+        raise ConfigurationError(
+            "%s.late_policy accepts only %s, got %r"
+            % (where, ", ".join(LATE_POLICIES), policy)
+        )
+    return {
+        "event_time": event_time,
+        "watermark_delay": delay,
+        "late_policy": policy,
+    }
+
+
 def _validate_source(raw, index, seen_ids):
     where = "sources[%d]" % index
     if not isinstance(raw, dict):
@@ -174,6 +219,7 @@ def _validate_source(raw, index, seen_ids):
             raise ConfigurationError(
                 "%s.dedup_window must be a positive integer" % where
             )
+    watermark = _validate_watermark(raw, where)
     raw_transforms = raw.get("transforms", [])
     if not isinstance(raw_transforms, list):
         raise ConfigurationError("%s.transforms must be a list" % where)
@@ -191,6 +237,10 @@ def _validate_source(raw, index, seen_ids):
     }
     if "dedup_window" in raw:
         spec["dedup_window"] = dedup_window
+    if watermark is not None:
+        # Only added when the trio is configured, so sources without
+        # watermark support keep their old configuration fingerprint.
+        spec.update(watermark)
     spec["transforms"] = transforms
     return spec
 

@@ -40,6 +40,9 @@ sources:
     path: data/orders.jsonl
     batch_size: 100       # 正整数，每处理这么多条提交一次检查点
     dedup_window: 100     # 可省略；正整数 N，按 event_id 对最近 N-1 条去重
+    event_time: meta.ts  # 可省略（水位线三件套，须同时出现）：
+    watermark_delay: 5   #   转换前 payload 内的点分路径 / 有限非负数 / drop|error
+    late_policy: drop
     transforms:            # 可省略；来源级转换，在公共 transforms 之后按序执行
       - op: cast
         field: total
@@ -159,6 +162,59 @@ transforms:                # 可省略；按序执行，对全部 source 生效
 - 配置 `dedup_window` 会进入配置指纹，改动它会使旧检查点不可恢复；
   未配置时配置指纹与旧版逐字节一致，既有检查点可正常 replay。
 
+### 事件时间水位线（event_time / watermark_delay / late_policy）
+
+每个 source 可以配置三件套 `event_time`、`watermark_delay`、`late_policy`，
+**三者必须同时出现**：只出现其中一个或两个、取值或路径非法、或在三件套之外
+出现未知键，都是 `ConfigurationError`（退出码 2）。三件套都不配置的 source
+行为与之前完全一致。
+
+- `event_time`：指向**转换前** payload 的点分路径（如 `meta.ts`），路径语法
+  与 transform 字段路径相同。
+- `watermark_delay`：与事件时间同一数值刻度上的**有限非负数**（布尔、字符串、
+  负数、NaN、无穷均非法）；整数与小数均可，`0` 合法。
+- `late_policy`：只接受 `drop` 或 `error`。
+
+启用后，每个 source 各自独立维护已观察到的最大事件时间 `max`，水位线为
+`watermark = max - watermark_delay`。每条记录在任何转换之前按以下顺序判定：
+
+1. 从转换前 payload 读取事件时间：路径必须存在（逐级父路径必须是对象），
+   值必须是有限的非布尔数值；路径缺失、父路径不是对象，或值为 `null`、
+   字符串、布尔、数组、对象、`NaN`、无穷，都是 `DataValidationError`
+   （退出码 3），当前批次不提交。CSV 源的单元格在转换前恒为字符串，因此
+   直接把字符串列作为 `event_time`（即使配置了 `cast`）同样报
+   `DataValidationError`——判定发生在转换之前。
+2. 用该记录**进入前**的水位线判定：事件时间严格小于水位线才算迟到；等于
+   水位线不迟到；source 的首条记录没有水位线，永不迟到。
+3. 非迟到记录的事件时间随后参与最大值更新——即使该记录之后被
+   `dedup_window` 判重丢弃、被 `filter` 丢弃，或 `explode` 产生零条输出，
+   最大值都照常抬高。迟到记录不抬高最大值。
+
+迟到策略：
+
+- `late_policy: drop`：迟到记录**仍被消费**——计入 `batch_size` 与已提交输入
+  前缀，并滑入去重窗口——但不执行转换、不输出 JSON Lines、不改变
+  `schema_version`、不抬高最大事件时间。
+- `late_policy: error`：迟到记录抛出 `DataValidationError`（退出码 3），
+  当前批次及其后的结果不提交；该记录不计入消费数、不滑入去重窗口。修复输入
+  后 replay，从最后已提交边界按当时的水位线重新判定，不重复、不跳过。
+
+其他不变量：
+
+- 判定顺序为 信封校验 → 水位线 → 去重窗口 → 公共转换 → 来源转换；去重、
+  转换、source 顺序、`event_id` 与 `schema_version` 的既有语义不变。水位线
+  与去重窗口都按 source 独立维护，互不影响。
+- 三件套进入配置指纹：改动任一项都会使旧检查点不可恢复；不配置三件套的
+  source 其指纹与旧版一致。
+- 最大事件时间与水位线随每个 source 的已提交边界持久化（检查点中保存
+  `event_time`、`watermark_delay`、`late_policy`、`max_event_time`），replay
+  恢复后继续。这会把检查点版本提升为 4；只配置去重的检查点仍为版本 3，
+  两者都不配置的仍为版本 2。
+- 启用水位线的配置若检查点缺少、损坏水位线状态，类型错误，或与配置不一致
+  （路径、delay、policy 对不上，`max_event_time` 在已消费记录后为空或不是
+  有限数值），或版本 2/3 检查点配合水位线配置，都是 `CheckpointError`
+  （退出码 4）。未启用水位线的旧检查点仍可正常 replay。
+
 ## 记录格式（JSON Lines）
 
 输入每行一个 JSON 对象，至少包含：
@@ -176,6 +232,9 @@ transforms:                # 可省略；按序执行，对全部 source 生效
 - 按配置中 source 的顺序处理；`source_id` 必须与所属 source 的 id 一致。
 - 未配置 `filter` 与 `explode` 时每条输入恰好输出一次；被 `filter` 命中
   的记录不产生输出，`explode` 则按数组元素数产生零到多条输出。
+- 配置水位线三件套时，`late_policy: drop` 的迟到记录被消费但不产生输出、
+  不改变 `schema_version`、不抬高最大事件时间；`late_policy: error` 的迟到
+  记录直接报错，当前批次不提交。
 - 同一 source 的 `data` 发生字段新增、字段删除或 cast 类型改变时，
   `schema_version` 单调递增；值变化本身不产生新版本。旧记录不回写。
 - 每 `batch_size` 条以及每个 source 结束时刷盘并原子替换检查点。
@@ -205,7 +264,10 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
 结束处的字节偏移，`input_hash` 为输入字节前缀 `[0:offset]` 的 SHA-256。
 配置了 `dedup_window` 的 source 还会在每个已提交边界保存完整滑动窗口
 （`dedup_window` 与 `dedup_keys`），因此窗口随批次持久化、崩溃后可精确
-恢复；这会把检查点版本提升为 3，未配置去重的检查点仍为版本 2。
+恢复。配置了水位线三件套的 source 还保存 `event_time`、
+`watermark_delay`、`late_policy` 与 `max_event_time`（最大事件时间），
+水位线随之持久化、replay 后继续。任一 source 启用水位线会把检查点版本
+提升为 4（仅去重为 3，两者皆无为 2）。
 
 - `run` 要求 `--output` 与 `--checkpoint` 均不存在；`replay` 要求两者
   均存在。
@@ -219,6 +281,10 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
 - 检查点缺少或写坏去重窗口状态、保存的窗口与当前配置不一致（如
   `dedup_window` 被改动）、窗口长度与记录数矛盾，或版本 2 检查点配合
   配置了去重的配置，都是 `CheckpointError`（退出码 4）；
+- 检查点缺少或写坏水位线状态、保存的 `event_time` / `watermark_delay` /
+  `late_policy` 与当前配置不一致、`max_event_time` 类型非法或与记录数矛盾，
+  或版本 2/3 检查点配合配置了水位线的配置，同样是 `CheckpointError`
+  （退出码 4）；
 - 无新记录时文件结果确定，可反复 replay。
 
 ## 错误与退出码
@@ -227,9 +293,9 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
 
 | 类型 | 退出码 | 触发场景 |
 | --- | --- | --- |
-| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径、过滤或 explode 配置非法、`dedup_window` 非正整数 |
-| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败、过滤条件无法求值、explode 目标非数组/元素非对象/键冲突、`event_id` 为数组或对象 |
-| `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、已提交前缀改变或输入变短、去重窗口状态缺失/损坏/与配置或记录数不一致 |
+| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径、过滤或 explode 配置非法、`dedup_window` 非正整数、水位线三件套缺失/不齐/取值非法 |
+| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败、过滤条件无法求值、explode 目标非数组/元素非对象/键冲突、`event_id` 为数组或对象、事件时间缺失或不是有限非布尔数值、`late_policy: error` 时记录迟到 |
+| `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、已提交前缀改变或输入变短、去重窗口状态缺失/损坏/与配置或记录数不一致、水位线状态缺失/损坏/与配置不一致或版本过旧 |
 | `SourceError` | 5 | 输入不可读 |
 | `SinkError` | 5 | 输出或检查点不可写 |
 
