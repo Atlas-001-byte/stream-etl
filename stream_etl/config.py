@@ -11,7 +11,7 @@ A configuration is a YAML mapping with two keys::
         transforms:           # optional, source-level; run after the
           - op: ...           # shared top-level transforms
     transforms:
-      - op: rename | drop | set | cast | filter
+      - op: rename | drop | set | cast | filter | explode
         ...
 
 Only these keys are recognised; anything else is a ConfigurationError so a
@@ -29,7 +29,7 @@ CAST_TYPES = ("string", "integer", "number", "boolean")
 COMPARE_OPS = ("eq", "ne", "lt", "lte", "gt", "gte")
 ORDERING_COMPARES = ("lt", "lte", "gt", "gte")
 SUPPORTED_SOURCE_TYPES = ("jsonl", "csv")
-TRANSFORM_OPS = ("rename", "drop", "set", "cast", "filter")
+TRANSFORM_OPS = ("rename", "drop", "set", "cast", "filter", "explode")
 TOP_LEVEL_KEYS = ("sources", "transforms")
 SOURCE_REQUIRED_KEYS = ("id", "type", "path", "batch_size")
 SOURCE_KEYS = SOURCE_REQUIRED_KEYS + ("dedup_window", "transforms")
@@ -78,7 +78,7 @@ def _validate_transform(raw, index, prefix="transforms"):
             if key not in raw:
                 raise ConfigurationError("%s (%s) requires %r" % (where, op, key))
             split_path(raw[key])
-    elif op in ("drop", "cast", "set"):
+    elif op in ("drop", "cast", "set", "explode"):
         allowed["field"] = None
         if "field" not in raw:
             raise ConfigurationError("%s (%s) requires 'field'" % (where, op))

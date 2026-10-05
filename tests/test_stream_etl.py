@@ -2822,3 +2822,549 @@ transforms:
     assert [r["event_id"] for r in read_jsonl(out)] == ["2"]
     assert read_checkpoint(cp)["sources"]["alpha"]["records"] == 3
 
+
+
+# --------------------------------------------------------------------------
+# Explode transform: configuration validation
+# --------------------------------------------------------------------------
+
+
+def test_config_explode_valid_top_and_source_level():
+    config = parse_config_text(
+        "sources:\n"
+        "  - id: s\n"
+        "    type: jsonl\n"
+        "    path: /tmp/x\n"
+        "    batch_size: 1\n"
+        "    transforms:\n"
+        "      - op: explode\n"
+        "        field: nested.items\n"
+        "transforms:\n"
+        "  - op: explode\n"
+        "    field: items\n"
+    )
+    assert config.transforms == [{"op": "explode", "field": "items"}]
+    assert config.sources[0]["transforms"] == [
+        {"op": "explode", "field": "nested.items"}]
+
+
+@pytest.mark.parametrize(
+    "body,needle",
+    [
+        ("  - op: explode\n", "requires 'field'"),
+        ("  - op: explode\n    field: 1\n", "field path"),
+        ("  - op: explode\n    field: .bad\n", "illegal field path"),
+        ("  - op: explode\n    field: a..b\n", "illegal field path"),
+        ("  - op: explode\n    field: a\n    value: 1\n", "unknown keys"),
+        ("  - op: explode\n    field: a\n    type: string\n", "unknown keys"),
+        ("  - op: explod\n    field: a\n", "unknown operation"),
+    ],
+)
+def test_config_explode_errors(body, needle):
+    with pytest.raises(ConfigurationError) as exc:
+        parse_config_text(
+            "sources:\n"
+            "  - id: s\n"
+            "    type: jsonl\n"
+            "    path: /tmp/x\n"
+            "    batch_size: 1\n"
+            "transforms:\n"
+            + body
+        )
+    assert needle in str(exc.value)
+
+
+def test_config_explode_accepted_for_csv_source():
+    config = parse_config_text(
+        "sources:\n"
+        "  - id: s\n"
+        "    type: csv\n"
+        "    path: /tmp/x.csv\n"
+        "    batch_size: 1\n"
+        "    transforms:\n"
+        "      - op: explode\n"
+        "        field: items\n"
+    )
+    assert config.sources[0]["transforms"] == [
+        {"op": "explode", "field": "items"}]
+
+
+def test_explode_in_config_fingerprint():
+    without = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n")
+    with_explode = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n"
+        "transforms:\n  - op: explode\n    field: items\n")
+    assert without.fingerprint() != with_explode.fingerprint()
+
+
+# --------------------------------------------------------------------------
+# Explode transform: branch semantics (unit level)
+# --------------------------------------------------------------------------
+
+
+def explode(data, transforms):
+    return engine.apply_branches(data, transforms, "test")
+
+
+def test_explode_merges_elements_into_same_level():
+    out = explode(
+        {"keep": "k", "items": [{"b": 2}, {"b": 3, "c": 4}], "tail": 9},
+        [{"op": "explode", "field": "items"}])
+    assert out == [
+        {"keep": "k", "tail": 9, "b": 2},
+        {"keep": "k", "tail": 9, "b": 3, "c": 4},
+    ]
+    # the array field itself is gone from every branch
+    assert all("items" not in branch for branch in out)
+
+
+def test_explode_output_order_follows_array_order():
+    items = [{"v": i} for i in range(5)]
+    out = explode({"items": items}, [{"op": "explode", "field": "items"}])
+    assert [branch["v"] for branch in out] == [0, 1, 2, 3, 4]
+
+
+def test_explode_empty_array_yields_no_branches():
+    assert explode({"a": 1, "items": []},
+                   [{"op": "explode", "field": "items"}]) == []
+
+
+def test_explode_nested_path_keeps_outer_fields():
+    out = explode(
+        {"meta": {"tags": [{"k": "a"}, {"k": "b"}]}, "keep": 1},
+        [{"op": "explode", "field": "meta.tags"}])
+    assert out == [
+        {"meta": {"k": "a"}, "keep": 1},
+        {"meta": {"k": "b"}, "keep": 1},
+    ]
+
+
+def test_explode_filter_keeps_subset_of_branches():
+    transforms = [
+        {"op": "explode", "field": "items"},
+        {"op": "filter", "field": "v", "compare": "lt", "value": 5},
+    ]
+    out = explode({"items": [{"v": 1}, {"v": 9}, {"v": 2}]}, transforms)
+    assert out == [{"v": 1}, {"v": 2}]
+
+
+def test_explode_filter_before_explode_can_drop_whole_input():
+    transforms = [
+        {"op": "filter", "field": "keep", "compare": "eq", "value": True},
+        {"op": "explode", "field": "items"},
+    ]
+    assert explode({"keep": False, "items": [{"v": 1}]}, transforms) == []
+    assert explode({"keep": True, "items": [{"v": 1}, {"v": 2}]},
+                   transforms) == [{"keep": True, "v": 1},
+                                   {"keep": True, "v": 2}]
+
+
+def test_nested_explode_fans_out_again():
+    transforms = [
+        {"op": "explode", "field": "groups"},
+        {"op": "explode", "field": "items"},
+    ]
+    data = {"groups": [
+        {"name": "g1", "items": [{"x": 1}, {"x": 2}]},
+        {"name": "g2", "items": [{"x": 3}]},
+    ]}
+    assert explode(data, transforms) == [
+        {"name": "g1", "x": 1},
+        {"name": "g1", "x": 2},
+        {"name": "g2", "x": 3},
+    ]
+
+
+def test_transforms_around_explode_run_at_right_time():
+    transforms = [
+        {"op": "set", "field": "pre", "value": 0},
+        {"op": "explode", "field": "items"},
+        {"op": "set", "field": "post", "value": 7},
+    ]
+    out = explode({"items": [{"b": 2}, {"b": 3}]}, transforms)
+    assert out == [
+        {"pre": 0, "b": 2, "post": 7},
+        {"pre": 0, "b": 3, "post": 7},
+    ]
+
+
+def test_explode_branches_are_independent():
+    # every branch is a deep copy: nested objects are not shared and a
+    # transform mutating one branch's nesting cannot be observed by the
+    # sibling or by the original input.
+    data = {"items": [{"k": "a", "nested": {"x": 1}},
+                      {"k": "b", "nested": {"x": 2}}]}
+    transforms = [
+        {"op": "explode", "field": "items"},
+        {"op": "set", "field": "nested.y", "value": 7},
+    ]
+    out = explode(data, transforms)
+    assert out == [
+        {"k": "a", "nested": {"x": 1, "y": 7}},
+        {"k": "b", "nested": {"x": 2, "y": 7}},
+    ]
+    assert out[0]["nested"] is not out[1]["nested"]
+    assert data == {"items": [{"k": "a", "nested": {"x": 1}},
+                              {"k": "b", "nested": {"x": 2}}]}
+    # an explode failure leaves the original data untouched
+    bad = {"a": 1, "items": [{"a": 2}]}
+    with pytest.raises(DataValidationError):
+        explode(bad, [{"op": "explode", "field": "items"}])
+    assert bad == {"a": 1, "items": [{"a": 2}]}
+
+
+def test_apply_transforms_empty_explode_looks_like_filtered_record():
+    # legacy single-record view: an empty fan-out reports "no output",
+    # the same way a dropped filter does
+    assert engine.apply_transforms(
+        {"items": []}, [{"op": "explode", "field": "items"}],
+        "test") is None
+
+
+@pytest.mark.parametrize(
+    "data,field",
+    [
+        ({}, "items"),                              # path missing
+        ({"items": 1}, "items"),                    # not an array
+        ({"items": "x"}, "items"),                  # string
+        ({"items": None}, "items"),                 # null
+        ({"items": [{"v": 1}]}, "missing"),         # missing element path
+        ({"a": 5}, "a.b"),                          # parent not an object
+        ({"items": [[1]]}, "items"),                # element is array
+        ({"items": ["x"]}, "items"),               # element is string
+        ({"items": [None]}, "items"),              # element is null
+        ({"a": 1, "items": [{"a": 2}]}, "items"),   # key conflict
+        ({"a": 1, "items": [{"b": 1}, {"a": 2}]}, "items"),  # 2nd conflicts
+        ({"meta": {"x": 1}}, "meta.tags"),          # nested missing
+        ({"meta": 1}, "meta.tags"),                 # nested parent scalar
+    ],
+)
+def test_explode_data_validation_errors(data, field):
+    with pytest.raises(DataValidationError):
+        engine.apply_branches(data, [{"op": "explode", "field": field}],
+                              "test")
+
+
+def test_explode_element_key_conflict_message_names_key():
+    with pytest.raises(DataValidationError) as exc:
+        engine.apply_branches(
+            {"keep": 1, "items": [{"keep": 2}]},
+            [{"op": "explode", "field": "items"}], "test")
+    assert "keep" in str(exc.value)
+
+
+# --------------------------------------------------------------------------
+# Explode transform: end to end (jsonl)
+# --------------------------------------------------------------------------
+
+
+EXPLODE_CFG = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: 2
+transforms:
+  - op: explode
+    field: items
+"""
+
+
+def test_explode_end_to_end_fanout_and_envelope(work):
+    rc, out, cp, _ = run_simple(work, [
+        env_record("s", "e1", {"keep": "k1",
+                               "items": [{"v": 1}, {"v": 2}]}),
+        env_record("s", "e2", {"keep": "k2", "items": []}),
+        env_record("s", "e3", {"keep": "k3", "items": [{"v": 3}]}),
+    ], cfg_text=EXPLODE_CFG)
+    assert rc == 0
+    rows = read_jsonl(out)
+    # empty array produces no output; all branches share the input event_id
+    assert [r["event_id"] for r in rows] == ["e1", "e1", "e3"]
+    assert all(r["source_id"] == "s" for r in rows)
+    assert rows[0]["data"] == {"keep": "k1", "v": 1}
+    assert rows[1]["data"] == {"keep": "k1", "v": 2}
+    assert rows[2]["data"] == {"keep": "k3", "v": 3}
+    assert all(set(r) == {"source_id", "event_id", "schema_version", "data"}
+               for r in rows)
+    # consumed-input accounting counts inputs, never fan-out outputs
+    doc = read_checkpoint(cp)
+    assert doc["sources"]["s"]["records"] == 3
+    assert doc["version"] == 2
+    assert doc["sink_offset"] == out.stat().st_size
+
+
+def test_explode_batches_count_input_records_not_branches(work):
+    # batch_size 2 and every input fans out to three outputs: commits happen
+    # after every two *input* records, so two full batches are committed.
+    rows = [
+        env_record("s", i, {"items": [{"v": 3 * i + j} for j in range(3)]})
+        for i in range(4)
+    ]
+    rc, out, cp, _ = run_simple(work, rows, cfg_text=EXPLODE_CFG)
+    assert rc == 0
+    result = read_jsonl(out)
+    assert len(result) == 12
+    assert [r["event_id"] for r in result] == [
+        i for i in range(4) for _ in range(3)]
+    assert read_checkpoint(cp)["sources"]["s"]["records"] == 4
+
+
+def test_explode_schema_versions_observe_each_output(work):
+    cfg = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: 10
+"""
+    rc, out, cp, _ = run_simple(work, [
+        env_record("s", 1, {"items": [{"a": 1}]}),                    # v1
+        env_record("s", 2, {"items": [{"a": 1, "b": 2}]}),            # v2
+        env_record("s", 3, {"items": []}),                            # no version
+        env_record("s", 4, {"items": [{"a": 1}, {"a": 1, "c": 3}]}),  # v3,v4
+    ], cfg_text=cfg + "transforms:\n  - op: explode\n    field: items\n")
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["schema_version"] for r in rows] == [1, 2, 3, 4]
+    assert read_checkpoint(cp)["sources"]["s"]["schema_version"] == 4
+
+
+def test_explode_failed_batch_is_not_committed(work):
+    # batch_size 2: input 1 fans out to three outputs but the batch is not
+    # at its boundary yet; input 2 fails while exploding, so nothing in the
+    # batch commits and no checkpoint is ever written.
+    rc, out, cp, _ = run_simple(work, [
+        env_record("s", 1, {"items": [{"v": 1}, {"v": 2}, {"v": 3}]}),
+        env_record("s", 2, {"items": "not-an-array"}),
+    ], cfg_text=EXPLODE_CFG)
+    assert rc == 3
+    assert not cp.exists()
+
+
+def test_explode_branch_transform_error_rolls_back_input_batch(work):
+    # batch_size 1: input 1 fans out and commits; input 2's second branch
+    # fails a later cast, so input 2 stays uncommitted even though its first
+    # branch reached the output as an uncommitted tail.
+    cfg = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: 1
+transforms:
+  - op: explode
+    field: items
+  - op: cast
+    field: v
+    type: integer
+"""
+    src = work / "s.jsonl"
+    cfgp = work / "c.yaml"
+    cfgp.write_text(cfg.format(src=str(src)), encoding="utf-8")
+    write_jsonl(src, [
+        env_record("s", 1, {"items": [{"v": "1"}, {"v": "2"}]}),
+        env_record("s", 2, {"items": [{"v": "3"}, {"v": "bad"}]}),
+    ])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    rc = cli_main(["run", "-c", str(cfgp), "-o", str(out), "-p", str(cp)])
+    assert rc == 3
+    # only input 1 committed; input 2 raised before any of its branches was
+    # written, so the output ends exactly at the committed boundary.
+    doc = read_checkpoint(cp)
+    assert doc["sources"]["s"]["records"] == 1
+    assert doc["sink_offset"] == out.stat().st_size
+
+    # fix input 2 and replay: the uncommitted branch tail is truncated and
+    # the whole input is reprocessed, yielding both branches exactly once
+    write_jsonl(src, [
+        env_record("s", 1, {"items": [{"v": "1"}, {"v": "2"}]}),
+        env_record("s", 2, {"items": [{"v": "3"}, {"v": "4"}]}),
+    ])
+    assert cli_main(["replay", "-c", str(cfgp), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    assert [(r["event_id"], r["data"]["v"]) for r in rows] == [
+        (1, 1), (1, 2), (2, 3), (2, 4)]
+    assert read_checkpoint(cp)["sources"]["s"]["records"] == 2
+
+
+@pytest.mark.parametrize(
+    "payload,needle",
+    [
+        ({"items": 5}, "not an array"),
+        ({"items": [1, 2]}, "not a JSON object"),
+        ({"v": 1, "items": [{"v": 2}]}, "conflicts with sibling"),
+        ({"other": []}, "does not exist"),
+    ],
+)
+def test_explode_data_errors_exit_code_3(work, capsys, payload, needle):
+    rc, out, cp, _ = run_simple(work, [env_record("s", 1, payload)],
+                                cfg_text=EXPLODE_CFG)
+    assert rc == 3
+    err = capsys.readouterr().err
+    assert err.startswith("Error: DataValidationError")
+    assert needle in err
+
+
+def test_explode_replay_continues_without_dupes(work):
+    src = work / "s.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(EXPLODE_CFG.format(src=str(src)), encoding="utf-8")
+    write_jsonl(src, [
+        env_record("s", 1, {"items": [{"v": 1}, {"v": 2}]}),
+        env_record("s", 2, {"items": []}),
+    ])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+    with open(src, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(env_record("s", 3, {"items": [{"v": 3}]})) + "\n")
+        fp.write(json.dumps(env_record(
+            "s", 4, {"items": [{"v": 4}, {"v": 5}]})) + "\n")
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == [1, 1, 3, 4, 4]
+    assert [r["data"]["v"] for r in rows] == [1, 2, 3, 4, 5]
+    doc = read_checkpoint(cp)
+    assert doc["sources"]["s"]["records"] == 4
+    assert doc["sink_offset"] == out.stat().st_size
+    # idempotent with no new input
+    size = out.stat().st_size
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    assert out.stat().st_size == size
+
+
+def test_explode_replay_truncates_uncommitted_branch_tail(work):
+    src = work / "s.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(EXPLODE_CFG.format(src=str(src)), encoding="utf-8")
+    write_jsonl(src, [
+        env_record("s", 1, {"items": [{"v": 1}, {"v": 2}]}),
+        env_record("s", 2, {"items": [{"v": 3}]}),
+    ])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+    committed = read_checkpoint(cp)["sink_offset"]
+    with open(out, "ab") as fp:
+        fp.write(b'{"source_id":"s","event_id":"ghost","schema_version":9,'
+                 b'"data":{"v": 99}}\n')
+    with open(src, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(env_record(
+            "s", 3, {"items": [{"v": 4}, {"v": 5}]})) + "\n")
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == [1, 1, 2, 3, 3]
+    assert read_checkpoint(cp)["sink_offset"] == out.stat().st_size
+    assert committed < out.stat().st_size
+
+
+def test_source_level_explode_runs_after_shared_transforms(work):
+    cfg = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: 10
+    transforms:
+      - op: rename
+        from: list
+        to: items
+      - op: explode
+        field: items
+      - op: cast
+        field: v
+        type: number
+transforms:
+  - op: set
+    field: shared
+    value: true
+"""
+    rc, out, _, _ = run_simple(work, [
+        env_record("s", 1, {"list": [{"v": "1"}, {"v": "2"}]}),
+    ], cfg_text=cfg)
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert rows[0]["data"] == {"shared": True, "v": 1.0}
+    assert rows[1]["data"] == {"shared": True, "v": 2.0}
+
+
+def test_explode_with_dedup_keys_on_input_records(work):
+    cfg = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: 10
+    dedup_window: 5
+transforms:
+  - op: explode
+    field: items
+"""
+    rc, out, cp, _ = run_simple(work, [
+        env_record("s", "dup", {"items": [{"v": 1}, {"v": 2}]}),
+        env_record("s", "dup", {"items": [{"v": 3}]}),   # duplicate input
+        env_record("s", "other", {"items": [{"v": 4}]}),
+    ], cfg_text=cfg)
+    assert rc == 0
+    rows = read_jsonl(out)
+    # dedup is decided per input before any explode, so the second "dup"
+    # fans out zero outputs even though its branch content differs
+    assert [r["event_id"] for r in rows] == ["dup", "dup", "other"]
+    doc = read_checkpoint(cp)
+    assert doc["version"] == 3
+    assert doc["sources"]["s"]["records"] == 3
+    assert doc["sources"]["s"]["dedup_keys"] == ["dup", "dup", "other"]
+
+
+# --------------------------------------------------------------------------
+# Explode transform: CSV parity (CSV data starts as a flat string object, so
+# an explode target is a string there and must fail with the same data
+# semantics as jsonl)
+# --------------------------------------------------------------------------
+
+
+CSV_EXPLODE_CFG = """
+sources:
+  - id: alpha
+    type: csv
+    path: {src}
+    batch_size: 1
+transforms:
+  - op: explode
+    field: v
+"""
+
+
+def test_csv_explode_scalar_field_is_data_error(work, capsys):
+    src = work / "s.csv"
+    cfg = work / "c.yaml"
+    cfg.write_text(CSV_EXPLODE_CFG.format(src=str(src)), encoding="utf-8")
+    write_csv(src, "source_id,event_id,v\n"
+                   "alpha,1,a\n")
+    out, cp = work / "o.jsonl", work / "cp.json"
+    rc = cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 3
+    err = capsys.readouterr().err
+    assert err.startswith("Error: DataValidationError")
+    assert "not an array" in err
+
+
+def test_csv_explode_missing_column_is_data_error(work, capsys):
+    src = work / "s.csv"
+    cfg = work / "c.yaml"
+    cfg.write_text(
+        CSV_EXPLODE_CFG.format(src=str(src)).replace("field: v",
+                                                     "field: items"),
+        encoding="utf-8")
+    write_csv(src, "source_id,event_id,v\n"
+                   "alpha,1,a\n")
+    out, cp = work / "o.jsonl", work / "cp.json"
+    rc = cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 3
+    assert "does not exist" in capsys.readouterr().err

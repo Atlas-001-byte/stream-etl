@@ -60,6 +60,8 @@ transforms:                # 可省略；按序执行，对全部 source 生效
     field: total
     compare: gte          # eq | ne | lt | lte | gt | gte
     value: 0
+  - op: explode
+    field: items          # 按数组元素展开，一条输入派生多条输出
 ```
 
 `type` 取 `jsonl` 或 `csv`，两者可在 `sources` 中混用并按配置顺序处理；
@@ -68,13 +70,16 @@ transforms:                # 可省略；按序执行，对全部 source 生效
 
 每个 source 可省略 `transforms`（行为与之前一致）；配置后先执行顶层公共
 转换，再按自身顺序执行该来源的转换。来源级转换的元素与公共转换相同
-（`rename` / `drop` / `set` / `cast` / `filter`），校验规则、错误类型与
-数据语义完全一致；两者都进入配置指纹，任一变化都会使旧检查点不可恢复。
+（`rename` / `drop` / `set` / `cast` / `filter` / `explode`），校验规则、
+错误类型与数据语义完全一致；两者都进入配置指纹，任一变化都会使旧检查点
+不可恢复。
 
 字段路径为点分路径（如 `a.b.c`），支持嵌套 payload：
 
 - `rename`：源路径必须存在，目标父路径必须存在，目标字段不得已存在；
 - `drop`、`cast`：路径必须存在；
+- `explode`：路径必须存在且为数组；数组被移除，其 JSON 对象元素按数
+  组顺序合并到同层，一个元素派生一条分支（详见“数组展开”小节）；
 - `set`：父路径必须存在（可新建叶子字段）；
 - `cast` 仅接受 `string`、`integer`、`number`、`boolean`，转换失败即
   数据校验错误，当前批次不提交；
@@ -102,6 +107,46 @@ transforms:                # 可省略；按序执行，对全部 source 生效
   不引发 `schema_version` 变化；`schema_version` 只依据实际输出的连续
   `data` 形状演进。无过滤项时每条输入恰好输出一次；有过滤项时命中的
   记录输出零次、其余恰好一次，replay 依旧不重复、不跳过。
+
+### 数组展开（op: explode）
+
+`explode` 只需一个 `field` 键，沿用现有点分字段路径；可放在公共
+`transforms` 或来源级 `transforms` 的任意位置，与其他转换按配置顺序
+交错执行：
+
+```yaml
+  - op: explode
+    field: items          # 当前 data 中该路径必须是一个数组
+```
+
+执行到 `explode` 时，读取当前 `data` 中该路径的数组，**移除原数组字段**，
+并按数组元素顺序把每个元素（必须是 JSON 对象）的键合并到数组所在的同层
+字段中，一个元素派生一条独立分支：
+
+- 合并只发生在数组所在层：数组外的同层字段原样保留在每条分支上，
+  更外层的字段也原样保留；元素键不得与同层保留字段冲突，否则
+  `DataValidationError`。
+- 分支的信封（`source_id`、`event_id`）原样保留，输出仍是现有 JSON
+  Lines 记录，不增加任何新字段；同一输入派生出的各条输出共享同一个
+  `event_id`。
+- `explode` 之后的转换对每个分支独立继续执行：`filter` 可只保留部分
+  分支，后续 `explode` 可再次展开。输出顺序按数组顺序与配置顺序稳定
+  确定（先数组顺序，再沿转换序列展开）。
+- 空数组产生零条输出，但该输入**仍作为一条已消费输入**计入
+  `batch_size` 与已提交输入前缀；非空数组每个元素产生一条输出。
+- `schema_version` 只观察每条实际输出的 `data`：新增、删除或类型形状
+  变化按现有规则递增；空数组或被 `filter` 消除的分支不创建版本。
+- 公共转换仍先于来源级转换，两者均可含任意位置的 `explode`；CSV 与
+  JSONL 使用完全相同的 `data` 语义（CSV 初始 `data` 为扁平字符串对象，
+  需要数组时仍需由上游转换构造）。
+- 配置阶段 `field` 缺失、非字符串、路径非法、包含未知配置键或 op 配置
+  不完整都是 `ConfigurationError`（退出码 2）。
+- 数据阶段字段路径不存在、父路径不是对象、目标值不是数组、元素不是
+  JSON 对象或元素键与同层保留字段冲突，都是 `DataValidationError`
+  （退出码 3），当前批次不提交；任一分支的后续转换或过滤失败同样不
+  提交当前输入批次。
+- 未配置 `explode` 时每条输入恰好输出一次的既有行为不变；检查点格式
+  与版本不变，旧配置仍可读取旧检查点并确定性续跑。
 
 ### 有界去重（dedup_window）
 
@@ -146,7 +191,9 @@ transforms:                # 可省略；按序执行，对全部 source 生效
 ```
 
 - 按配置中 source 的顺序处理；`source_id` 必须与所属 source 的 id 一致。
-- 无过滤项时每条输入恰好输出一次；被 `filter` 命中的记录不产生输出。
+- 未配置 `filter` / `explode` 时每条输入恰好输出一次；被 `filter` 命中
+  的记录不产生输出；`explode` 按数组元素使一条输入派生零条（空数组）
+  或多条输出，同一输入的各条输出共享 `event_id`。
 - 同一 source 的 `data` 发生字段新增、字段删除或 cast 类型改变时，
   `schema_version` 单调递增；值变化本身不产生新版本。旧记录不回写。
 - 每 `batch_size` 条以及每个 source 结束时刷盘并原子替换检查点。
@@ -198,8 +245,8 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
 
 | 类型 | 退出码 | 触发场景 |
 | --- | --- | --- |
-| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径、过滤配置非法、`dedup_window` 非正整数 |
-| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败、过滤条件无法求值、`event_id` 为数组或对象 |
+| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径、过滤配置非法、`dedup_window` 非正整数、`explode` 缺少/非法 `field` 或含未知键 |
+| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败、过滤条件无法求值、`event_id` 为数组或对象、`explode` 目标非数组/元素非对象/元素键冲突 |
 | `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、已提交前缀改变或输入变短、去重窗口状态缺失/损坏/与配置或记录数不一致 |
 | `SourceError` | 5 | 输入不可读 |
 | `SinkError` | 5 | 输出或检查点不可写 |

@@ -11,13 +11,32 @@ Two source types are supported:
 
 For every input record the configured transforms are applied to the payload
 in order (shared transforms first, then the source's own), and one output
-object is emitted::
+object is emitted (or several, when an ``explode`` transform fans the
+record out)::
 
     {"source_id": ..., "event_id": ..., "schema_version": N, "data": {...}}
 
 A ``filter`` transform instead decides whether the record survives: when its
 condition fails the input record is still consumed (it counts toward the
 batch and the committed prefix) but emits no output and no schema change.
+
+An ``explode`` transform names an array field with the same dotted-path
+notation as the other transforms. When it runs, the array at that path is
+removed from the current data and each of its object elements is merged into
+the array's parent level, producing one independent branch per element in
+array order: a record that previously held one data object now flows through
+the remaining transforms as several. Every branch keeps the record's
+``source_id`` / ``event_id`` envelope and gains no extra output field. The
+transforms that follow the ``explode`` (including further ``filter`` and
+``explode`` transforms) run independently per branch, so a filter may keep
+only some branches and a later explode may fan them out again; the output
+order follows array order followed by configuration order. An empty array
+yields zero branches. Whether it fans out to zero, one or many outputs, the
+input is still a single consumed record: it counts once toward the batch and
+the committed prefix, and every branch of the same input shares its
+``event_id``. Element keys must not collide with the sibling fields kept
+beside the removed array; otherwise the batch fails like any other data
+error.
 
 A source may configure ``dedup_window: N`` (a positive integer). The source
 then keeps the ``event_id`` values of the last ``N - 1`` *consumed* input
@@ -39,6 +58,7 @@ tail of the output using the sink byte offset, then continues, so records
 are never duplicated or skipped.
 """
 
+import copy
 import hashlib
 import json
 import os
@@ -244,14 +264,20 @@ def _filter_matches(data, raw, where):
 # --------------------------------------------------------------------------
 
 
-def apply_transforms(data, transforms, where):
-    """Apply transforms in order to ``data`` (mutated in place).
+def _apply_record_transforms(data, transforms, where, start=0):
+    """Apply non-explode transforms from ``start`` up to the first explode.
 
-    Returns the transformed data, or ``None`` when a ``filter`` transform
-    drops the record (the input record then produces no output).
+    The data object is mutated in place. Returns ``(data, index)`` where
+    ``index`` is the position of the first ``explode`` not yet processed
+    (equal to ``len(transforms)`` once the list is exhausted); when a
+    ``filter`` drops the record the return is ``(None, index)``.
     """
-    for raw in transforms:
+    index = start
+    while index < len(transforms):
+        raw = transforms[index]
         op = raw["op"]
+        if op == "explode":
+            return data, index
         if op == "rename":
             parts_from = split_path(raw["from"])
             parts_to = split_path(raw["to"])
@@ -276,12 +302,98 @@ def apply_transforms(data, transforms, where):
             parent[key] = raw["value"]
         elif op == "filter":
             if not _filter_matches(data, raw, where):
-                return None
+                return None, index
         else:  # cast
             parts = split_path(raw["field"])
             parent, key = _parent_and_key(data, parts, where)
             parent[key] = _cast_value(parent[key], raw["type"], where + " (cast)")
-    return data
+        index += 1
+    return data, index
+
+
+def _explode_field(data, raw, where):
+    """Fan one data object out over the object elements of an array field.
+
+    The array named by the dotted path must exist and hold JSON objects. A
+    template copy of the whole data object is made with the array removed at
+    its own level; each element is then merged into a copy of that template
+    in array order. Element keys may not collide with the sibling fields
+    kept beside the removed array. All validation happens before any copy is
+    built, so an error leaves the input data untouched. Each returned branch
+    is an independent copy, so transforms applied to one branch can never be
+    observed by another or by the input.
+    """
+    parts = split_path(raw["field"])
+    parent, key = _parent_and_key(data, parts, where)
+    value = parent[key]
+    if not isinstance(value, list):
+        raise DataValidationError(
+            "%s: explode field %r is not an array" % (where, _desc(parts))
+        )
+    siblings = set(parent) - {key}
+    for position, element in enumerate(value):
+        if not isinstance(element, dict):
+            raise DataValidationError(
+                "%s: explode element %d of %r is not a JSON object"
+                % (where, position, _desc(parts))
+            )
+        conflict = set(element) & siblings
+        if conflict:
+            raise DataValidationError(
+                "%s: explode element %d of %r conflicts with sibling "
+                "field %r" % (where, position, _desc(parts),
+                              sorted(conflict)[0])
+            )
+    # Build one template copy of the data with the array removed; each
+    # branch then only needs a copy of that template plus its own element,
+    # rather than a copy of the whole data carrying every sibling element.
+    template = copy.deepcopy(data)
+    template_parent, template_key = _parent_and_key(template, parts, where)
+    del template_parent[template_key]
+    branches = []
+    for element in value:
+        branch = copy.deepcopy(template)
+        branch_parent = _walk(branch, parts[:-1], where)
+        branch_parent.update(copy.deepcopy(element))
+        branches.append(branch)
+    return branches
+
+
+def apply_branches(data, transforms, where, start=0):
+    """Run transforms over one input's data, fanning out at each explode.
+
+    Returns the list of output data objects in stable order (array order at
+    each ``explode`` followed by configured transform order). An empty list
+    means the input produced no output at all -- a filter dropped it or an
+    explode consumed an empty array.
+    """
+    current, index = _apply_record_transforms(
+        data, transforms, where, start)
+    if current is None:
+        return []
+    if index >= len(transforms):
+        return [current]
+    raw = transforms[index]
+    results = []
+    for branch in _explode_field(current, raw, where):
+        # Every branch independently runs the transforms that follow the
+        # explode; a filter may prune it and a later explode may fan it out
+        # again.
+        results.extend(
+            apply_branches(branch, transforms, where, index + 1))
+    return results
+
+
+def apply_transforms(data, transforms, where):
+    """Apply transforms in order to ``data`` (mutated in place).
+
+    Returns the transformed data, or ``None`` when a ``filter`` transform
+    drops the record. This is the single-record view used by transform lists
+    without an ``explode``; lists containing explode transforms must go
+    through :func:`apply_branches`, which can return any number of outputs.
+    """
+    branches = apply_branches(data, transforms, where)
+    return branches[0] if branches else None
 
 
 # --------------------------------------------------------------------------
@@ -1079,25 +1191,33 @@ def _emit_record(spec, state, config, sink, source_id, event_id, payload,
     if state.note_event(event_id):
         state.records += 1
         return
-    data = apply_transforms(payload, config.transforms, where)
+    # The shared transforms run first and may fan the single input out into
+    # several branches (or zero, via an empty explode or a filter).
+    datas = apply_branches(payload, config.transforms, where)
     # Source-level transforms run after the shared ones, in their own
-    # configured order.
-    if data is not None:
-        data = apply_transforms(data, spec["transforms"], where)
-    # A filtered-out record is still consumed: it counts toward the batch
-    # and the committed input prefix, it just produces no output record and
-    # no schema change.
+    # configured order, independently per branch: every surviving branch
+    # flows through them on its own and may be filtered or exploded again.
+    if datas:
+        sourced = []
+        for data in datas:
+            sourced.extend(apply_branches(data, spec["transforms"], where))
+        datas = sourced
+    # Every input reaching this point is one consumed record -- including an
+    # input that exploded over an empty array or whose branches were all
+    # filtered out: it counts once toward the batch and the committed input
+    # prefix, it just produces no output and no schema change.
     state.records += 1
-    if data is None:
-        return
-    state.note_schema(schema_fingerprint(data))
-    record = {
-        "source_id": source_id,
-        "event_id": event_id,
-        "schema_version": state.schema_version,
-        "data": data,
-    }
-    _write_record(sink, record)
+    # Each surviving branch is one output record; the branches of one input
+    # share its event_id and are written in the stable fan-out order.
+    for data in datas:
+        state.note_schema(schema_fingerprint(data))
+        record = {
+            "source_id": source_id,
+            "event_id": event_id,
+            "schema_version": state.schema_version,
+            "data": data,
+        }
+        _write_record(sink, record)
 
 
 def _process_jsonl(spec, state, config, sink, commit, pending, fp, hasher):
