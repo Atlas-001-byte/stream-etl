@@ -11,13 +11,21 @@ Two source types are supported:
 
 For every input record the configured transforms are applied to the payload
 in order (shared transforms first, then the source's own), and one output
-object is emitted::
+object is emitted per surviving branch::
 
     {"source_id": ..., "event_id": ..., "schema_version": N, "data": {...}}
 
 A ``filter`` transform instead decides whether the record survives: when its
 condition fails the input record is still consumed (it counts toward the
 batch and the committed prefix) but emits no output and no schema change.
+
+An ``explode`` transform fans one record out into several branches: the
+array at its dotted field path is removed and each of its elements (which
+must be a JSON object) is merged with the array's former sibling fields to
+form one branch, in array order. Every branch then continues through the
+remaining transforms independently, so one input record may emit zero, one
+or many output records, all sharing the input's ``event_id``; an empty
+array emits none but is still consumed like a filtered record.
 
 A source may configure ``dedup_window: N`` (a positive integer). The source
 then keeps the ``event_id`` values of the last ``N - 1`` *consumed* input
@@ -39,6 +47,7 @@ tail of the output using the sink byte offset, then continues, so records
 are never duplicated or skipped.
 """
 
+import copy
 import hashlib
 import json
 import os
@@ -244,44 +253,123 @@ def _filter_matches(data, raw, where):
 # --------------------------------------------------------------------------
 
 
-def apply_transforms(data, transforms, where):
-    """Apply transforms in order to ``data`` (mutated in place).
+def _apply_one(data, raw, where):
+    """Apply one non-explode transform to a single branch (mutated in place).
 
     Returns the transformed data, or ``None`` when a ``filter`` transform
-    drops the record (the input record then produces no output).
+    drops the branch.
     """
-    for raw in transforms:
-        op = raw["op"]
-        if op == "rename":
-            parts_from = split_path(raw["from"])
-            parts_to = split_path(raw["to"])
-            value = _walk(data, parts_from, where)
-            dest_parent, dest_key = _parent_existing(data, parts_to, where)
-            if dest_key in dest_parent:
-                # renaming over an existing field would silently lose data
-                raise DataValidationError(
-                    "%s: rename destination %r already exists"
-                    % (where, _desc(parts_to))
-                )
-            src_parent, src_key = _parent_and_key(data, parts_from, where)
-            del src_parent[src_key]
-            dest_parent[dest_key] = value
-        elif op == "drop":
-            parts = split_path(raw["field"])
-            parent, key = _parent_and_key(data, parts, where)
-            del parent[key]
-        elif op == "set":
-            parts = split_path(raw["field"])
-            parent, key = _parent_existing(data, parts, where)
-            parent[key] = raw["value"]
-        elif op == "filter":
-            if not _filter_matches(data, raw, where):
-                return None
-        else:  # cast
-            parts = split_path(raw["field"])
-            parent, key = _parent_and_key(data, parts, where)
-            parent[key] = _cast_value(parent[key], raw["type"], where + " (cast)")
+    op = raw["op"]
+    if op == "rename":
+        parts_from = split_path(raw["from"])
+        parts_to = split_path(raw["to"])
+        value = _walk(data, parts_from, where)
+        dest_parent, dest_key = _parent_existing(data, parts_to, where)
+        if dest_key in dest_parent:
+            # renaming over an existing field would silently lose data
+            raise DataValidationError(
+                "%s: rename destination %r already exists"
+                % (where, _desc(parts_to))
+            )
+        src_parent, src_key = _parent_and_key(data, parts_from, where)
+        del src_parent[src_key]
+        dest_parent[dest_key] = value
+    elif op == "drop":
+        parts = split_path(raw["field"])
+        parent, key = _parent_and_key(data, parts, where)
+        del parent[key]
+    elif op == "set":
+        parts = split_path(raw["field"])
+        parent, key = _parent_existing(data, parts, where)
+        parent[key] = raw["value"]
+    elif op == "filter":
+        if not _filter_matches(data, raw, where):
+            return None
+    else:  # cast
+        parts = split_path(raw["field"])
+        parent, key = _parent_and_key(data, parts, where)
+        parent[key] = _cast_value(parent[key], raw["type"], where + " (cast)")
     return data
+
+
+def _explode(data, parts, where):
+    """Fan one branch out into one branch per element of the array at ``parts``.
+
+    Each element must be a JSON object; its keys are merged with the fields
+    that shared the array's level (the array field itself is removed), and a
+    key colliding with one of those siblings is a data error. Every branch
+    is a fully independent copy, so later transforms on one branch cannot
+    leak into another. An empty array yields zero branches.
+    """
+    parent, key = _parent_and_key(data, parts, where)
+    value = parent[key]
+    if not isinstance(value, list):
+        raise DataValidationError(
+            "%s: field %r is not an array" % (where, _desc(parts)))
+    siblings = set(parent) - {key}
+    branches = []
+    for index, element in enumerate(value):
+        if not isinstance(element, dict):
+            raise DataValidationError(
+                "%s: element %d of %r is not an object"
+                % (where, index, _desc(parts)))
+        conflict = sorted(set(element) & siblings)
+        if conflict:
+            raise DataValidationError(
+                "%s: element key %r of %r conflicts with an existing field"
+                % (where, conflict[0], _desc(parts)))
+        branch = copy.deepcopy(data)
+        branch_parent, branch_key = _parent_and_key(branch, parts, where)
+        merged = branch_parent[branch_key][index]
+        del branch_parent[branch_key]
+        branch_parent.update(merged)
+        branches.append(branch)
+    return branches
+
+
+def apply_pipeline(datas, transforms, where):
+    """Apply transforms in order to every branch in ``datas``.
+
+    Returns the surviving branches in stable (array, then configuration)
+    order: ``filter`` drops its branch, ``explode`` replaces its branch by
+    one branch per array element, and every other transform maps one branch
+    to one branch.
+    """
+    branches = list(datas)
+    for raw in transforms:
+        if raw["op"] == "explode":
+            parts = split_path(raw["field"])
+            branches = [
+                branch
+                for data in branches
+                for branch in _explode(data, parts, where)
+            ]
+        else:
+            branches = [
+                result
+                for result in (_apply_one(data, raw, where)
+                               for data in branches)
+                if result is not None
+            ]
+        if not branches:
+            break
+    return branches
+
+
+def apply_transforms(data, transforms, where):
+    """Apply transforms in order to a single ``data`` (mutated in place).
+
+    Returns the transformed data, or ``None`` when a ``filter`` transform
+    drops the record (the input record then produces no output). When an
+    ``explode`` transform fans the record out into several branches, the
+    list of branches is returned instead.
+    """
+    branches = apply_pipeline([data], transforms, where)
+    if len(branches) == 1:
+        return branches[0]
+    if not branches:
+        return None
+    return branches
 
 
 # --------------------------------------------------------------------------
@@ -1079,25 +1167,25 @@ def _emit_record(spec, state, config, sink, source_id, event_id, payload,
     if state.note_event(event_id):
         state.records += 1
         return
-    data = apply_transforms(payload, config.transforms, where)
+    branches = apply_pipeline([payload], config.transforms, where)
     # Source-level transforms run after the shared ones, in their own
     # configured order.
-    if data is not None:
-        data = apply_transforms(data, spec["transforms"], where)
-    # A filtered-out record is still consumed: it counts toward the batch
-    # and the committed input prefix, it just produces no output record and
-    # no schema change.
+    if branches:
+        branches = apply_pipeline(branches, spec["transforms"], where)
+    # A record whose branches all die (filtered out, or an explode over an
+    # empty array) is still consumed: it counts toward the batch and the
+    # committed input prefix, it just produces no output records and no
+    # schema change.
     state.records += 1
-    if data is None:
-        return
-    state.note_schema(schema_fingerprint(data))
-    record = {
-        "source_id": source_id,
-        "event_id": event_id,
-        "schema_version": state.schema_version,
-        "data": data,
-    }
-    _write_record(sink, record)
+    for data in branches:
+        state.note_schema(schema_fingerprint(data))
+        record = {
+            "source_id": source_id,
+            "event_id": event_id,
+            "schema_version": state.schema_version,
+            "data": data,
+        }
+        _write_record(sink, record)
 
 
 def _process_jsonl(spec, state, config, sink, commit, pending, fp, hasher):
