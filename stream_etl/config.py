@@ -12,6 +12,8 @@ A configuration is a YAML mapping with two keys::
         watermark_delay: <finite non-negative number, optional>
         late_policy: drop | error (optional; the three watermark keys
                       must be configured together)
+        schema_policy: allow | compatible (optional; only "compatible"
+                      enters the spec and the fingerprint)
         transforms:           # optional, source-level; run after the
           - op: ...           # shared top-level transforms
     transforms:
@@ -33,13 +35,14 @@ CAST_TYPES = ("string", "integer", "number", "boolean")
 COMPARE_OPS = ("eq", "ne", "lt", "lte", "gt", "gte")
 LATE_POLICIES = ("drop", "error")
 ORDERING_COMPARES = ("lt", "lte", "gt", "gte")
+SCHEMA_POLICIES = ("allow", "compatible")
 SUPPORTED_SOURCE_TYPES = ("jsonl", "csv")
 TRANSFORM_OPS = ("rename", "drop", "set", "cast", "filter", "explode")
 TOP_LEVEL_KEYS = ("sources", "transforms")
 SOURCE_REQUIRED_KEYS = ("id", "type", "path", "batch_size")
 WATERMARK_KEYS = ("event_time", "watermark_delay", "late_policy")
-SOURCE_KEYS = SOURCE_REQUIRED_KEYS + ("dedup_window", "transforms") \
-    + WATERMARK_KEYS
+SOURCE_KEYS = SOURCE_REQUIRED_KEYS + ("dedup_window", "transforms",
+                                      "schema_policy") + WATERMARK_KEYS
 
 
 def split_path(path):
@@ -181,6 +184,18 @@ def _validate_source(raw, index, seen_ids):
             raise ConfigurationError(
                 "%s.dedup_window must be a positive integer" % where
             )
+    # schema_policy is only added to the spec when it is "compatible"; an
+    # explicit "allow" and an absent key both keep the legacy behaviour and
+    # leave the configuration fingerprint byte-identical.
+    schema_policy = None
+    if "schema_policy" in raw:
+        schema_policy = raw["schema_policy"]
+        if not isinstance(schema_policy, str) or schema_policy \
+                not in SCHEMA_POLICIES:
+            raise ConfigurationError(
+                "%s.schema_policy accepts only %s, got %r"
+                % (where, ", ".join(SCHEMA_POLICIES), schema_policy)
+            )
     raw_transforms = raw.get("transforms", [])
     if not isinstance(raw_transforms, list):
         raise ConfigurationError("%s.transforms must be a list" % where)
@@ -222,6 +237,8 @@ def _validate_source(raw, index, seen_ids):
     }
     if "dedup_window" in raw:
         spec["dedup_window"] = dedup_window
+    if schema_policy == "compatible":
+        spec["schema_policy"] = "compatible"
     if present:
         for key in WATERMARK_KEYS:
             spec[key] = raw[key]

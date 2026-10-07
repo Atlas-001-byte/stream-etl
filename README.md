@@ -43,6 +43,7 @@ sources:
     event_time: meta.ts   # 可省略；三键必须同时配置，指向转换前 payload 的点分路径
     watermark_delay: 5    # 可省略；与 event_time 同一刻度的有限非负数值
     late_policy: drop     # 可省略；drop 或 error
+    schema_policy: allow  # 可省略；allow（缺省，自由演进）或 compatible（受控演进）
     transforms:            # 可省略；来源级转换，在公共 transforms 之后按序执行
       - op: cast
         field: total
@@ -195,6 +196,47 @@ transforms:                # 可省略；按序执行，对全部 source 生效
   （退出码 4）。未配置水位线的 source 行为完全不变，版本 2/3 的旧检查点
   仍可正常 replay。
 
+### 来源级受控 Schema 演进（schema_policy）
+
+每个 source 可配置 `schema_policy`，只接受 `allow` 与 `compatible`：
+
+- 缺省或显式 `allow`：完全保留既有行为——字段新增、删除、改类都按
+  `schema_version` 单调递增规则自由演进，不进配置指纹（与旧版逐字节
+  一致），旧检查点照常 replay。
+- `compatible`：在公共 transforms 与来源 transforms 按原顺序全部执行
+  之后，对该 source **实际产生的每条 data** 按输出顺序逐条判定。第一条
+  实际输出建立兼容基线，此后：
+  - 对象**新增字段**是兼容变化（含嵌套对象新增字段），继续按现有规则
+    单调递增 `schema_version`，并把新字段并入该 source 的累积基线；
+  - **删除字段**不兼容（基线上出现过而当前输出缺少的字段）；
+  - 既有字段在 `string`、`integer`、`number`、`boolean`、`null` 之间
+    **改类**不兼容（注意 `integer` 与 `number` 是不同类）；
+  - 对象与数组或标量之间**改结构**不兼容；
+  - **数组元素形状集合变化**不兼容：基线数组的元素形状集合一旦确立即
+    固定，元素对象仅新增字段也算新形状；元素形状集合不变时数组长度、
+    顺序与值任意变化都兼容。
+- 判定只观察实际输出：被 `filter` 过滤的记录、`explode` 的空数组与被
+  过滤消除的分支、去重命中与水位线迟到丢弃的记录都不参与判定，也不
+  建立基线；一个 source 若始终没有任何输出，则没有基线。
+- `compatible` 下第一条不兼容输出抛 `DataValidationError`（退出码 3），
+  其所在批次不提交（该批次此前已写入输出文件的记录成为未提交尾部）；
+  replay 先按 sink 偏移截掉未提交输出，再从同一输入边界继续，因此修复
+  输入后续跑与一次性连续运行的保留记录、顺序与 `schema_version` 完全
+  一致。被拒输出不会改变基线。
+- 兼容基线只在已提交边界随检查点保存（检查点版本提升为 5），并与配置
+  指纹、已消费记录数、已输出条数（`emitted`）及已提交输入前缀保持
+  一致；`schema_policy` / 基线 / `emitted` 状态缺失、损坏、类型非法、
+  与配置或记录数互相矛盾，或版本 2/3/4 检查点配合配置了 compatible 的
+  配置，都是 `CheckpointError`（退出码 4）。
+- `schema_policy` 取非字符串值或非 `allow`/`compatible` 的字符串都是
+  `ConfigurationError`（退出码 2）；source 下出现任何未知键同样是
+  `ConfigurationError`。配置 `compatible` 会进入配置指纹，
+  改动它（包括改成 `allow` 或缺省）会使旧检查点不可恢复。
+- `compatible` 与 `dedup_window`、水位线三键、jsonl/csv、公共/来源
+  transforms、`filter`、`explode` 正交；各 source 独立判定。CSV 的表头
+  固定了列集合，数据记录形状恒为扁平字符串对象，因此 compatible 下
+  正常数据不会出现不兼容变化（多列/少列仍按 CSV 规则报数据错误）。
+
 ## 记录格式（JSON Lines）
 
 输入每行一个 JSON 对象，至少包含：
@@ -243,15 +285,20 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
 （`dedup_window` 与 `dedup_keys`），因此窗口随批次持久化、崩溃后可精确
 恢复；这会把检查点版本提升为 3，未配置去重的检查点仍为版本 2。配置了
 水位线的 source 还会保存 `event_time`、`watermark_delay`、`late_policy`
-与 `max_event_time`、`watermark`，检查点版本提升为 4。
+与 `max_event_time`、`watermark`，检查点版本提升为 4。配置了
+`schema_policy: compatible` 的 source 还会在每个已提交边界保存
+`schema_policy`、`compatibility_baseline`（累积兼容基线）与 `emitted`
+（实际输出条数），检查点版本提升为 5；显式 `allow` 或缺省 source 不保存
+这些状态，检查点仍为版本 2/3/4，版本 2/3/4 的旧检查点仍可正常 replay。
 
 - `run` 要求 `--output` 与 `--checkpoint` 均不存在；`replay` 要求两者
   均存在。
 - replay 先校验每个 source 的已提交输入前缀哈希一致且文件未变短，否则
   报告 `CheckpointError`（退出码 4）；随后截断 output 中超过已提交偏移
   的未提交尾部，再从最后已提交批次之后的下一条记录继续，不重复、不跳过。
-  去重窗口与水位线（最大事件时间）随已提交边界恢复，因此 replay 截断
-  未提交输出后继续处理，得到与一次性连续运行完全相同的保留记录与顺序；
+  去重窗口、水位线（最大事件时间）与 compatible 的兼容基线随已提交
+  边界恢复，因此 replay 截断未提交输出后继续处理，得到与一次性连续运行
+  完全相同的保留记录、顺序与 `schema_version`；
   反复 replay 而无新输入时结果确定。
 - 对 csv 源，进度定位于逻辑记录边界，因此跨物理行的记录也能精确恢复；
 - 检查点缺少或写坏去重窗口状态、保存的窗口与当前配置不一致（如
@@ -259,6 +306,9 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
   配置了去重的配置，都是 `CheckpointError`（退出码 4）；水位线状态
   （`max_event_time` / `watermark` 等）缺失、损坏、与配置或记录数不一致，
   或版本 2/3 检查点配合配置了水位线的配置，同样是 `CheckpointError`；
+  `schema_policy: compatible` 的基线 / `emitted` 状态缺失、损坏、与配置、
+  schema_version 或记录数互相矛盾，或版本 2/3/4 检查点配合 compatible
+  配置，也是 `CheckpointError`；
 - 无新记录时文件结果确定，可反复 replay。
 
 ## 错误与退出码
@@ -267,9 +317,9 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
 
 | 类型 | 退出码 | 触发场景 |
 | --- | --- | --- |
-| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径、过滤或 explode 配置非法、`dedup_window` 非正整数、水位线三键不全或取值非法 |
-| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败、过滤条件无法求值、explode 目标非数组/元素非对象/键冲突、`event_id` 为数组或对象、`event_time` 缺失或非法、`late_policy: error` 下记录迟到 |
-| `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、已提交前缀改变或输入变短、去重窗口或水位线状态缺失/损坏/与配置或记录数不一致 |
+| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径、过滤或 explode 配置非法、`dedup_window` 非正整数、水位线三键不全或取值非法、`schema_policy` 非字符串或取值非 `allow`/`compatible` |
+| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败、过滤条件无法求值、explode 目标非数组/元素非对象/键冲突、`event_id` 为数组或对象、`event_time` 缺失或非法、`late_policy: error` 下记录迟到、`schema_policy: compatible` 下第一条不兼容输出 |
+| `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、已提交前缀改变或输入变短、去重窗口/水位线/compatible 基线状态缺失/损坏/与配置或记录数不一致 |
 | `SourceError` | 5 | 输入不可读 |
 | `SinkError` | 5 | 输出或检查点不可写 |
 
