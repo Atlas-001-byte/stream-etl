@@ -43,6 +43,7 @@ sources:
     event_time: meta.ts   # 可省略；三键必须同时配置，指向转换前 payload 的点分路径
     watermark_delay: 5    # 可省略；与 event_time 同一刻度的有限非负数值
     late_policy: drop     # 可省略；drop 或 error
+    schema_policy: allow  # 可省略；allow 或 compatible
     transforms:            # 可省略；来源级转换，在公共 transforms 之后按序执行
       - op: cast
         field: total
@@ -133,6 +134,35 @@ transforms:                # 可省略；按序执行，对全部 source 生效
   不提交；任一分支的后续转换或过滤错误同样不提交当前输入批次。
 - 未配置 `explode` 的配置行为完全不变：每条输入恰好输出一次（被 `filter`
   命中的除外），旧配置仍可读取旧检查点并确定性续跑。
+
+### 来源级 Schema 策略（schema_policy）
+
+每个 source 可配置 `schema_policy`，只接受 `allow` 与 `compatible`
+两个字符串；键缺失或显式 `allow` 完全保留既有行为（形状自由演进，
+`schema_version` 按现有规则递增），且不进入配置指纹——为旧配置追加
+`schema_policy: allow` 后既有检查点仍可正常 replay。未知键、非法值
+或非字符串值都是 `ConfigurationError`（退出码 2）。
+
+`compatible` 在公共 transforms 与来源 transforms 按原顺序执行完之后，
+对该 source **实际产生**的每条 `data` 按输出顺序逐条判定：
+
+- 第一条实际输出建立兼容基线；此后对象**新增字段**（含嵌套对象）为
+  兼容变化，按现有规则单调递增 `schema_version`；
+- 删除字段、既有字段在 `string`/`integer`/`number`/`boolean`/`null`
+  之间改类、值在对象/数组/标量之间改结构、数组元素形状集合发生变化，
+  均为不兼容变化；
+- 被 `filter` 过滤的记录、`explode` 的空数组以及未输出的分支不参与
+  判定，既不建立也不推进基线。
+
+第一条不兼容输出抛 `DataValidationError`（退出码 3），所在批次不提
+交；replay 先截掉本批未提交输出，再从同一输入边界继续，因此修复输
+入后重放与连续运行结果一致。`compatible` 进入配置指纹，检查点版本
+提升为 5，并只在已提交边界保存兼容基线（`schema_policy` 与
+`schema_baseline`）；replay 时校验基线与配置指纹、记录数、
+`schema_version`、`schema_fingerprint` 相互一致，状态缺失、损坏、
+版本不匹配或互相矛盾都是 `CheckpointError`（退出码 4）。未配置
+`schema_policy` 的 source 行为完全不变，版本 2/3/4 的旧检查点仍可
+正常 replay。
 
 ### 有界去重（dedup_window）
 
@@ -243,7 +273,9 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
 （`dedup_window` 与 `dedup_keys`），因此窗口随批次持久化、崩溃后可精确
 恢复；这会把检查点版本提升为 3，未配置去重的检查点仍为版本 2。配置了
 水位线的 source 还会保存 `event_time`、`watermark_delay`、`late_policy`
-与 `max_event_time`、`watermark`，检查点版本提升为 4。
+与 `max_event_time`、`watermark`，检查点版本提升为 4。配置了
+`schema_policy: compatible` 的 source 还会保存 `schema_policy` 与
+`schema_baseline`（兼容基线），检查点版本提升为 5。
 
 - `run` 要求 `--output` 与 `--checkpoint` 均不存在；`replay` 要求两者
   均存在。
@@ -259,6 +291,10 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
   配置了去重的配置，都是 `CheckpointError`（退出码 4）；水位线状态
   （`max_event_time` / `watermark` 等）缺失、损坏、与配置或记录数不一致，
   或版本 2/3 检查点配合配置了水位线的配置，同样是 `CheckpointError`；
+  兼容基线状态（`schema_policy` / `schema_baseline`）缺失、损坏、与
+  `schema_version` / `schema_fingerprint` / 记录数矛盾，或版本 2/3/4
+  检查点配合配置了 `schema_policy: compatible` 的配置，同样是
+  `CheckpointError`；
 - 无新记录时文件结果确定，可反复 replay。
 
 ## 错误与退出码
@@ -267,9 +303,9 @@ CRLF，引号内允许换行，因此一条逻辑记录可跨越多条物理行�
 
 | 类型 | 退出码 | 触发场景 |
 | --- | --- | --- |
-| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径、过滤或 explode 配置非法、`dedup_window` 非正整数、水位线三键不全或取值非法 |
-| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败、过滤条件无法求值、explode 目标非数组/元素非对象/键冲突、`event_id` 为数组或对象、`event_time` 缺失或非法、`late_policy: error` 下记录迟到 |
-| `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、已提交前缀改变或输入变短、去重窗口或水位线状态缺失/损坏/与配置或记录数不一致 |
+| `ConfigurationError` | 2 | 配置缺失/非法、source 不完整/类型非法、未知操作、非法路径、过滤或 explode 配置非法、`dedup_window` 非正整数、水位线三键不全或取值非法、`schema_policy` 取值非法或非字符串 |
+| `DataValidationError` | 3 | jsonl 记录缺字段/格式错、CSV 表头或记录非法、路径不存在、cast 失败、过滤条件无法求值、explode 目标非数组/元素非对象/键冲突、`event_id` 为数组或对象、`event_time` 缺失或非法、`late_policy: error` 下记录迟到、`schema_policy: compatible` 下出现不兼容输出 |
+| `CheckpointError` | 4 | 检查点损坏、版本不匹配、配置不匹配、已提交前缀改变或输入变短、去重窗口或水位线状态缺失/损坏/与配置或记录数不一致、兼容基线状态缺失/损坏/互相矛盾 |
 | `SourceError` | 5 | 输入不可读 |
 | `SinkError` | 5 | 输出或检查点不可写 |
 

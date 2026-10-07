@@ -3875,3 +3875,608 @@ def test_watermark_config_change_invalidates_checkpoint(work, capsys):
     r = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
     assert r == 4
     assert "different configuration" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Schema policy: configuration
+# --------------------------------------------------------------------------
+
+
+def test_config_schema_policy_accepted():
+    config = parse_config_text(
+        "sources:\n"
+        "  - id: s\n"
+        "    type: jsonl\n"
+        "    path: /tmp/x\n"
+        "    batch_size: 1\n"
+        "    schema_policy: compatible\n"
+    )
+    src = config.sources[0]
+    assert src["schema_policy"] == "compatible"
+    assert set(src) == {
+        "id", "type", "path", "batch_size", "transforms", "schema_policy"}
+
+
+def test_config_schema_policy_allow_stays_out_of_spec():
+    # ``allow`` is the default behaviour, so the key is absent (not
+    # normalised into the spec) and the fingerprint stays byte-identical
+    # to a configuration without the key.
+    config = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n    schema_policy: allow\n"
+    )
+    assert "schema_policy" not in config.sources[0]
+
+
+def test_config_without_schema_policy_has_no_key():
+    config = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n"
+    )
+    assert "schema_policy" not in config.sources[0]
+
+
+@pytest.mark.parametrize(
+    "value", ['"permissive"', '"ALLOW"', "1", "1.5", "null", "true", '""'])
+def test_config_schema_policy_invalid(value):
+    with pytest.raises(ConfigurationError) as exc:
+        parse_config_text(
+            "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+            "    batch_size: 1\n    schema_policy: %s\n" % value
+        )
+    assert "schema_policy" in str(exc.value)
+
+
+def test_config_schema_policy_fingerprint():
+    plain = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n"
+    )
+    allow = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n    schema_policy: allow\n"
+    )
+    compatible = parse_config_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: /tmp/x\n"
+        "    batch_size: 1\n    schema_policy: compatible\n"
+    )
+    assert plain.fingerprint() == allow.fingerprint()
+    assert plain.fingerprint() != compatible.fingerprint()
+
+
+def test_config_schema_policy_error_exit_code_2(work, capsys):
+    cfg = work / "c.yaml"
+    cfg.write_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: x\n"
+        "    batch_size: 1\n    schema_policy: sometimes\n",
+        encoding="utf-8")
+    rc = cli_main(["run", "-c", str(cfg),
+                   "-o", str(work / "o"), "-p", str(work / "p")])
+    assert rc == 2
+    assert "schema_policy" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Schema policy: compatibility unit semantics
+# --------------------------------------------------------------------------
+
+
+def _shape(value):
+    return engine._schema_shape(value)
+
+
+def test_shape_extends_field_addition_only():
+    assert engine._shape_extends(_shape({"a": 1}), _shape({"a": 1, "b": "x"}))
+    assert engine._shape_extends(_shape({"a": 1}), _shape({"a": 2}))
+    # nested objects may also gain fields
+    assert engine._shape_extends(
+        _shape({"o": {"x": 1}}), _shape({"o": {"x": 1, "y": 2}}))
+    # equal shapes are compatible
+    assert engine._shape_extends(_shape({"a": 1}), _shape({"a": 1}))
+
+
+def test_shape_extends_rejects_incompatible_changes():
+    # field removal
+    assert not engine._shape_extends(
+        _shape({"a": 1, "b": 2}), _shape({"a": 1}))
+    # scalar retype (string/integer/number/boolean/null)
+    assert not engine._shape_extends(_shape({"a": 1}), _shape({"a": "1"}))
+    assert not engine._shape_extends(_shape({"a": 1}), _shape({"a": 1.5}))
+    assert not engine._shape_extends(_shape({"a": None}), _shape({"a": 1}))
+    assert not engine._shape_extends(_shape({"a": True}), _shape({"a": 1}))
+    # structure changes between object, array and scalar
+    assert not engine._shape_extends(
+        _shape({"a": {"x": 1}}), _shape({"a": [1]}))
+    assert not engine._shape_extends(
+        _shape({"a": {"x": 1}}), _shape({"a": 5}))
+    assert not engine._shape_extends(_shape({"a": [1]}), _shape({"a": 5}))
+    # array element shape set changes (both growing and shrinking)
+    assert not engine._shape_extends(
+        _shape({"a": [1, 2]}), _shape({"a": [1, "x"]}))
+    assert not engine._shape_extends(
+        _shape({"a": [1, "x"]}), _shape({"a": [1]}))
+    # same element shape set is fine
+    assert engine._shape_extends(_shape({"a": [1, 2]}), _shape({"a": [3]}))
+
+
+def _policy_state():
+    from stream_etl.engine import SourceState
+    return SourceState(
+        {"id": "s", "path": "/tmp/x", "transforms": [],
+         "schema_policy": "compatible"})
+
+
+def test_policy_first_output_establishes_baseline():
+    st = _policy_state()
+    fp = engine.schema_fingerprint({"a": 1, "b": "x"})
+    st.check_schema_compatible(fp, "test")      # never raises: no baseline
+    st.note_schema(fp)
+    assert st.schema_version == 1
+    st.check_schema_compatible(
+        engine.schema_fingerprint({"a": 1, "b": "x"}), "test")
+
+
+def test_policy_check_raises_on_incompatible_change():
+    st = _policy_state()
+    st.note_schema(engine.schema_fingerprint({"a": 1, "b": 2}))
+    with pytest.raises(DataValidationError):
+        st.check_schema_compatible(
+            engine.schema_fingerprint({"a": 1}), "test")
+    # a compatible extension passes and becomes the new baseline
+    st.check_schema_compatible(
+        engine.schema_fingerprint({"a": 1, "b": 2, "c": 3}), "test")
+    st.note_schema(engine.schema_fingerprint({"a": 1, "b": 2, "c": 3}))
+    with pytest.raises(DataValidationError):
+        st.check_schema_compatible(
+            engine.schema_fingerprint({"a": 1, "b": 2}), "test")
+
+
+def test_policy_disabled_state():
+    from stream_etl.engine import SourceState
+    st = SourceState({"id": "s", "path": "/tmp/x", "transforms": []})
+    assert st.schema_policy is None
+
+
+# --------------------------------------------------------------------------
+# Schema policy: jsonl end to end
+# --------------------------------------------------------------------------
+
+
+SP_CFG = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: {batch}
+    schema_policy: {policy}
+"""
+
+
+def run_policy(work, rows, policy="compatible", batch=10, cfg_text=None,
+               extra=""):
+    src = work / "s.jsonl"
+    cfg = work / "c.yaml"
+    template = cfg_text or SP_CFG
+    cfg.write_text(
+        template.format(src=str(src), batch=batch, policy=policy) + extra,
+        encoding="utf-8")
+    write_jsonl(src, rows)
+    out, cp = work / "o.jsonl", work / "cp.json"
+    rc = cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    return rc, out, cp, cfg, src
+
+
+def test_policy_field_addition_bumps_version(work):
+    rc, out, cp, _, _ = run_policy(work, [
+        env_record("s", 1, {"a": 1}),
+        env_record("s", 2, {"a": 1, "b": "x"}),      # add b: compatible
+        env_record("s", 3, {"a": 2, "b": "y"}),      # same shape
+        env_record("s", 4, {"a": 3, "b": "z", "c": True}),  # add c
+    ])
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["schema_version"] for r in rows] == [1, 2, 2, 3]
+    doc = read_checkpoint(cp)
+    assert doc["version"] == 5
+    entry = doc["sources"]["s"]
+    assert entry["schema_policy"] == "compatible"
+    assert entry["schema_baseline"] == entry["schema_fingerprint"]
+
+
+def test_policy_nested_field_addition(work):
+    rc, out, _, _, _ = run_policy(work, [
+        env_record("s", 1, {"o": {"x": 1}}),
+        env_record("s", 2, {"o": {"x": 1, "y": 2}}),
+    ])
+    assert rc == 0
+    assert [r["schema_version"] for r in read_jsonl(out)] == [1, 2]
+
+
+@pytest.mark.parametrize("first,second", [
+    ({"a": 1, "b": 2}, {"a": 1}),               # field removal
+    ({"a": 1}, {"a": "1"}),                     # integer -> string
+    ({"a": 1.5}, {"a": 1}),                     # number -> integer
+    ({"a": None}, {"a": 1}),                    # null -> integer
+    ({"a": True}, {"a": 1}),                    # boolean -> integer
+    ({"a": {"x": 1}}, {"a": [1]}),              # object -> array
+    ({"a": {"x": 1}}, {"a": 5}),                # object -> scalar
+    ({"a": [1]}, {"a": 5}),                     # array -> scalar
+    ({"a": [1, 2]}, {"a": [1, "x"]}),           # element shape set grows
+    ({"a": [1, "x"]}, {"a": [1]}),              # element shape set shrinks
+    ({"o": {"x": 1, "y": 2}}, {"o": {"x": 1}}),  # nested removal
+])
+def test_policy_incompatible_change_fails(work, capsys, first, second):
+    rc, out, _, _, _ = run_policy(work, [
+        env_record("s", 1, first),
+        env_record("s", 2, second),
+    ])
+    assert rc == 3
+    assert "schema_policy" in capsys.readouterr().err
+    # the first record established the baseline and was committed; the
+    # incompatible second record produced no output
+    assert [r["event_id"] for r in read_jsonl(out)] == [1]
+
+
+def test_policy_allow_keeps_free_evolution(work):
+    rc, out, cp, _, _ = run_policy(work, [
+        env_record("s", 1, {"a": 1, "b": "x"}),
+        env_record("s", 2, {"a": 1}),               # removal allowed
+        env_record("s", 3, {"a": "1"}),             # retype allowed
+    ], policy="allow")
+    assert rc == 0
+    assert [r["schema_version"] for r in read_jsonl(out)] == [1, 2, 3]
+    doc = read_checkpoint(cp)
+    assert doc["version"] == 2
+    assert "schema_policy" not in doc["sources"]["s"]
+    assert "schema_baseline" not in doc["sources"]["s"]
+
+
+def test_policy_filtered_records_do_not_participate(work):
+    cfg_text = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: 10
+    schema_policy: compatible
+transforms:
+  - op: filter
+    field: keep
+    compare: eq
+    value: true
+"""
+    rc, out, _, _, _ = run_policy(work, [
+        env_record("s", 1, {"keep": True, "a": 1}),
+        env_record("s", 2, {"keep": False}),        # filtered: not judged
+        env_record("s", 3, {"keep": True, "a": 2}),
+    ], cfg_text=cfg_text)
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == [1, 3]
+    assert [r["schema_version"] for r in rows] == [1, 1]
+
+
+def test_policy_explode_empty_array_does_not_participate(work):
+    cfg_text = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: 10
+    schema_policy: compatible
+transforms:
+  - op: explode
+    field: items
+"""
+    rc, out, _, _, _ = run_policy(work, [
+        env_record("s", 1, {"items": []}),              # zero branches
+        env_record("s", 2, {"items": [{"a": 1}]}),      # baseline
+        env_record("s", 3, {"items": [{"a": 2, "b": 3}]}),  # add b
+    ], cfg_text=cfg_text)
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == [2, 3]
+    assert [r["schema_version"] for r in rows] == [1, 2]
+
+
+def test_policy_explode_branches_judged_in_order(work):
+    cfg_text = """
+sources:
+  - id: s
+    type: jsonl
+    path: {src}
+    batch_size: 10
+    schema_policy: compatible
+transforms:
+  - op: explode
+    field: items
+"""
+    # one record fans out into a baseline branch and an extending branch
+    rc, out, _, _, _ = run_policy(work, [
+        env_record("s", 1, {"items": [{"a": 1}, {"a": 2, "b": 3}]}),
+    ], cfg_text=cfg_text)
+    assert rc == 0
+    assert [r["schema_version"] for r in read_jsonl(out)] == [1, 2]
+    # an incompatible branch fails the run
+    bad = work / "bad"
+    bad.mkdir()
+    rc, out, _, _, _ = run_policy(bad, [
+        env_record("s", 1, {"items": [{"a": 1}]}),
+        env_record("s", 2, {"items": [{"b": 1}]}),
+    ], cfg_text=cfg_text)
+    assert rc == 3
+    assert [r["event_id"] for r in read_jsonl(out)] == [1]
+
+
+def test_policy_failed_batch_is_not_committed(work, capsys):
+    src = work / "s.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(
+        SP_CFG.format(src=str(src), batch=2, policy="compatible"),
+        encoding="utf-8")
+    write_jsonl(src, [
+        env_record("s", 1, {"a": 1}),
+        env_record("s", 2, {"a": 2}),       # batch of 2 commits here
+        env_record("s", 3, {"a": 3}),       # written but uncommitted
+        env_record("s", 4, {"b": 1}),       # incompatible: run fails
+    ])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 3
+    assert "schema_policy" in capsys.readouterr().err
+    # the uncommitted tail (record 3) is still in the file for now
+    assert [r["event_id"] for r in read_jsonl(out)] == [1, 2, 3]
+    doc = read_checkpoint(cp)["sources"]["s"]
+    assert doc["records"] == 2
+    assert doc["schema_version"] == 1
+
+    # repair the incompatible record and replay: the uncommitted record 3
+    # is truncated first, then reprocessed from the same input boundary
+    write_jsonl(src, [
+        env_record("s", 1, {"a": 1}),
+        env_record("s", 2, {"a": 2}),
+        env_record("s", 3, {"a": 3}),
+        env_record("s", 4, {"a": 4, "b": 1}),   # adds b: compatible
+    ])
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == [1, 2, 3, 4]
+    assert [r["schema_version"] for r in rows] == [1, 1, 1, 2]
+    doc = read_checkpoint(cp)["sources"]["s"]
+    assert doc["records"] == 4
+    assert doc["schema_version"] == 2
+
+
+SP_ROWS = [
+    env_record("s", 1, {"a": 1}),
+    env_record("s", 2, {"a": 2}),
+    env_record("s", 3, {"a": 3, "b": "x"}),             # add b
+    env_record("s", 4, {"a": 4, "b": "y"}),
+    env_record("s", 5, {"a": 5, "b": "z", "c": True}),  # add c
+]
+
+
+def test_policy_replay_segmented_matches_continuous(work):
+    # Continuous reference.
+    rc, cont_out, cont_cp, _, _ = run_policy(work, SP_ROWS, batch=2)
+    assert rc == 0
+    cont_bytes = cont_out.read_bytes()
+    cont_src = read_checkpoint(cont_cp)["sources"]["s"]
+
+    # Segmented: first 3 records committed, then append and replay.
+    seg = work / "seg"
+    seg.mkdir()
+    seg_src = seg / "s.jsonl"
+    seg_cfg = seg / "c.yaml"
+    seg_cfg.write_text(
+        SP_CFG.format(src=str(seg_src), batch=2, policy="compatible"),
+        encoding="utf-8")
+    write_jsonl(seg_src, SP_ROWS[:3])
+    seg_out, seg_cp = seg / "o.jsonl", seg / "cp.json"
+    assert cli_main(["run", "-c", str(seg_cfg), "-o", str(seg_out),
+                     "-p", str(seg_cp)]) == 0
+    with open(seg_src, "a", encoding="utf-8") as fp:
+        for row in SP_ROWS[3:]:
+            fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+    assert cli_main(["replay", "-c", str(seg_cfg), "-o", str(seg_out),
+                     "-p", str(seg_cp)]) == 0
+    assert seg_out.read_bytes() == cont_bytes
+    seg_state = read_checkpoint(seg_cp)["sources"]["s"]
+    assert seg_state["records"] == cont_src["records"] == 5
+    assert seg_state["schema_version"] == cont_src["schema_version"] == 3
+    assert seg_state["schema_baseline"] == cont_src["schema_baseline"]
+
+
+def test_policy_replay_idempotent_without_new_input(work):
+    rc, out, cp, cfg, _ = run_policy(work, SP_ROWS, batch=2)
+    assert rc == 0
+    size, cp_bytes = out.stat().st_size, cp.read_bytes()
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    assert out.stat().st_size == size
+    assert cp.read_bytes() == cp_bytes
+
+
+def test_policy_allow_keeps_old_checkpoints_replayable(work):
+    # A plain run writes a version 2 checkpoint; adding an explicit
+    # ``schema_policy: allow`` leaves the fingerprint untouched, so the
+    # old checkpoint still replays and shapes evolve freely.
+    src = work / "s.jsonl"
+    cfg = work / "c.yaml"
+    plain = (
+        "sources:\n  - id: s\n    type: jsonl\n    path: %s\n"
+        "    batch_size: 1\n" % src)
+    cfg.write_text(plain, encoding="utf-8")
+    write_jsonl(src, [env_record("s", 1, {"a": 1})])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+    assert read_checkpoint(cp)["version"] == 2
+    with open(src, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(env_record("s", 2, {"b": 1})) + "\n")
+    cfg.write_text(
+        "sources:\n  - id: s\n    type: jsonl\n    path: %s\n"
+        "    batch_size: 1\n    schema_policy: allow\n" % src,
+        encoding="utf-8")
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    assert [r["event_id"] for r in rows] == [1, 2]
+    assert [r["schema_version"] for r in rows] == [1, 2]
+
+
+def test_policy_config_change_invalidates_checkpoint(work, capsys):
+    rc, out, cp, cfg, src = run_policy(work, [
+        env_record("s", 1, {"a": 1}),
+    ], batch=1)
+    assert rc == 0
+    # switching from compatible to allow changes the fingerprint
+    cfg.write_text(
+        SP_CFG.format(src=str(src), batch=1, policy="allow"),
+        encoding="utf-8")
+    r = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert r == 4
+    assert "different configuration" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Schema policy: checkpoint state errors
+# --------------------------------------------------------------------------
+
+
+def test_policy_replay_checkpoint_error_cases(work, capsys):
+    rc, out, cp, cfg, src = run_policy(work, [
+        env_record("s", 1, {"a": 1}),
+        env_record("s", 2, {"a": 2}),
+    ], batch=1)
+    assert rc == 0
+    with open(src, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(env_record("s", 3, {"a": 3})) + "\n")
+
+    def expect_error(mutator, needle):
+        backup = cp.read_bytes()
+        _mutate_checkpoint(cp, mutator)
+        r = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+        assert r == 4
+        assert needle in capsys.readouterr().err
+        cp.write_bytes(backup)
+
+    expect_error(lambda d: d["sources"]["s"].pop("schema_policy"),
+                 "missing the schema policy state")
+    expect_error(lambda d: d["sources"]["s"].pop("schema_baseline"),
+                 "missing the schema policy state")
+    expect_error(lambda d: d["sources"]["s"].__setitem__(
+        "schema_baseline", 7), "schema_baseline for source 's' is invalid")
+    expect_error(lambda d: d["sources"]["s"].__setitem__(
+        "schema_baseline", "other"), "contradicts its schema_fingerprint")
+    expect_error(lambda d: d["sources"]["s"].__setitem__(
+        "schema_version", 0), "inconsistent with its schema_version")
+    expect_error(lambda d: d["sources"]["s"].__setitem__(
+        "records", 0), "inconsistent with its record count")
+    expect_error(lambda d: d["sources"]["s"].__setitem__(
+        "schema_policy", "allow"), "differs from the configuration")
+    expect_error(lambda d: d.__setitem__("version", 4),
+                 "predates schema_policy")
+    expect_error(lambda d: d.__setitem__("version", 2),
+                 "predates schema_policy")
+
+
+def test_policy_state_rejected_for_plain_source(work, capsys):
+    # A checkpoint that carries policy state for a source whose
+    # configuration sets no compatible policy is corrupt.
+    a, b = work / "a.jsonl", work / "b.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(
+        "sources:\n"
+        "  - id: a\n    type: jsonl\n    path: %s\n    batch_size: 1\n"
+        "    schema_policy: compatible\n"
+        "  - id: b\n    type: jsonl\n    path: %s\n    batch_size: 1\n"
+        % (a, b), encoding="utf-8")
+    write_jsonl(a, [env_record("a", 1, {"x": 1})])
+    write_jsonl(b, [env_record("b", 1, {"y": 1})])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+    doc = read_checkpoint(cp)
+    assert doc["version"] == 5
+    assert "schema_policy" not in doc["sources"]["b"]
+    _mutate_checkpoint(cp, lambda d: d["sources"]["b"].__setitem__(
+        "schema_baseline", "x"))
+    rc = cli_main(["replay", "-c", str(cfg), "-o", str(out), "-p", str(cp)])
+    assert rc == 4
+    assert "carries schema policy state" in capsys.readouterr().err
+
+
+def test_policy_mixed_sources_process_independently(work):
+    a, b = work / "a.jsonl", work / "b.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(
+        "sources:\n"
+        "  - id: a\n    type: jsonl\n    path: %s\n    batch_size: 2\n"
+        "    schema_policy: compatible\n"
+        "  - id: b\n    type: jsonl\n    path: %s\n    batch_size: 2\n"
+        % (a, b), encoding="utf-8")
+    write_jsonl(a, [
+        env_record("a", 1, {"x": 1}),
+        env_record("a", 2, {"x": 2, "y": 3}),   # add y: compatible
+    ])
+    write_jsonl(b, [
+        env_record("b", 1, {"x": 1, "y": 2}),
+        env_record("b", 2, {"x": 1}),           # removal allowed for b
+    ])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    assert [r["source_id"] for r in rows] == ["a", "a", "b", "b"]
+    assert [r["schema_version"] for r in rows] == [1, 2, 1, 2]
+
+
+def test_policy_combines_with_watermark_and_dedup(work):
+    src = work / "s.jsonl"
+    cfg = work / "c.yaml"
+    cfg.write_text(
+        "sources:\n"
+        "  - id: s\n    type: jsonl\n    path: %s\n    batch_size: 2\n"
+        "    dedup_window: 5\n"
+        "    event_time: ts\n    watermark_delay: 2\n    late_policy: drop\n"
+        "    schema_policy: compatible\n" % src, encoding="utf-8")
+    write_jsonl(src, [
+        env_record("s", 1, {"ts": 10, "a": 1}),
+        env_record("s", 2, {"ts": 11, "a": 2}),
+        env_record("s", 3, {"ts": 12, "a": 3, "b": 4}),  # add b
+    ])
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+    doc = read_checkpoint(cp)
+    assert doc["version"] == 5
+    entry = doc["sources"]["s"]
+    assert entry["schema_policy"] == "compatible"
+    assert entry["max_event_time"] == 12
+    assert entry["dedup_window"] == 5
+    # replay with no new input is deterministic
+    size, cp_bytes = out.stat().st_size, cp.read_bytes()
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    assert out.stat().st_size == size
+    assert cp.read_bytes() == cp_bytes
+
+
+def test_policy_csv_source(work):
+    src = work / "s.csv"
+    src.write_text(
+        "source_id,event_id,a\ns,1,x\ns,2,y\n", encoding="utf-8")
+    cfg = work / "c.yaml"
+    cfg.write_text(
+        "sources:\n"
+        "  - id: s\n    type: csv\n    path: %s\n    batch_size: 1\n"
+        "    schema_policy: compatible\n" % src, encoding="utf-8")
+    out, cp = work / "o.jsonl", work / "cp.json"
+    assert cli_main(["run", "-c", str(cfg), "-o", str(out), "-p", str(cp)]) == 0
+    rows = read_jsonl(out)
+    assert [r["data"] for r in rows] == [{"a": "x"}, {"a": "y"}]
+    assert [r["schema_version"] for r in rows] == [1, 1]
+    doc = read_checkpoint(cp)
+    assert doc["version"] == 5
+    assert doc["sources"]["s"]["schema_policy"] == "compatible"
+    # replay with no new input is deterministic
+    assert cli_main(["replay", "-c", str(cfg), "-o", str(out),
+                     "-p", str(cp)]) == 0
+    assert [r["event_id"] for r in read_jsonl(out)] == ["1", "2"]

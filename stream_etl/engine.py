@@ -53,6 +53,21 @@ later deduplicated, filtered out or exploded into zero branches. The maximum
 and the watermark are persisted with every committed boundary and restored
 on replay.
 
+A source may configure ``schema_policy: compatible`` (the default,
+``allow``, keeps the historical behaviour). Under ``compatible`` every
+record the source actually emits — after the shared and source-level
+transforms ran in their configured order — is judged in emission order
+against the source's compatibility baseline. The first emitted record
+establishes the baseline; afterwards an object may only gain fields, while
+removing a field, retyping an existing field between
+string/integer/number/boolean/null, changing a value between object, array
+and scalar, or changing the element shape set of an array is an
+incompatible change and fails the record (and its batch) with a
+DataValidationError. Compatible changes keep bumping ``schema_version``
+under the usual rules; filtered records, empty arrays and dropped branches
+never take part in the judgement. The baseline is persisted with every
+committed boundary (checkpoint version 5) and validated on replay.
+
 Sources are processed in configuration order. Every ``batch_size`` records
 (and at each source boundary) the output is fsynced and the checkpoint is
 atomically replaced. The checkpoint stores the byte offset of the last
@@ -87,6 +102,12 @@ CHECKPOINT_VERSION_DEDUP = 3
 # by configurations that set the watermark triple; configurations without it
 # keep writing versions 2/3 and those checkpoints remain replayable.
 CHECKPOINT_VERSION_WATERMARK = 4
+# Version 5 adds the per-source compatibility baseline used by
+# ``schema_policy: compatible``. It is only used by configurations that set
+# the policy to ``compatible``; configurations without it (including an
+# explicit ``allow``) keep writing versions 2/3/4 and those checkpoints
+# remain replayable.
+CHECKPOINT_VERSION_SCHEMA_POLICY = 5
 ENCODING = "utf-8"
 BOM = b"\xef\xbb\xbf"
 EMPTY_PREFIX_HASH = hashlib.sha256(b"").hexdigest()
@@ -429,6 +450,27 @@ def schema_fingerprint(value):
                       sort_keys=True, separators=(",", ":"))
 
 
+def _shape_extends(base, new):
+    """True when ``new`` is a compatible evolution of the ``base`` shape.
+
+    Both arguments are decoded ``_schema_shape`` descriptors. An object may
+    only gain fields (every baseline field must still be present, itself a
+    compatible evolution); a scalar type tag must stay identical; an
+    array's element shape set must be exactly the same; and any change
+    between object, array and scalar is incompatible.
+    """
+    if isinstance(base, str) or isinstance(new, str):
+        return base == new
+    if "dict" in base and "dict" in new:
+        return all(
+            key in new["dict"] and _shape_extends(sub, new["dict"][key])
+            for key, sub in base["dict"].items()
+        )
+    if "list" in base and "list" in new:
+        return base["list"] == new["list"]
+    return False
+
+
 # --------------------------------------------------------------------------
 # Per-source state and checkpoint (de)serialisation
 # --------------------------------------------------------------------------
@@ -464,6 +506,10 @@ class SourceState:
             self.watermark_delay = spec["watermark_delay"]
             self.late_policy = spec["late_policy"]
         self.max_event_time = None
+        # ``schema_policy`` is None for sources without the policy (or with
+        # an explicit ``allow``: the legacy behaviour); ``compatible``
+        # constrains how the emitted ``data`` shapes may evolve.
+        self.schema_policy = spec.get("schema_policy")
 
     def watermark(self):
         """Current watermark, or None before the first consumed record."""
@@ -489,6 +535,23 @@ class SourceState:
         if fp != self.schema_fingerprint:
             self.schema_version += 1
             self.schema_fingerprint = fp
+
+    def check_schema_compatible(self, fp, where):
+        """Enforce ``schema_policy: compatible`` for one actual output.
+
+        The first emitted record establishes the compatibility baseline;
+        every later shape must extend it (objects may only gain fields).
+        The baseline is exactly the shape of the last accepted output, so
+        ``schema_fingerprint`` doubles as the persisted baseline.
+        """
+        if self.schema_fingerprint is None:
+            return
+        base = json.loads(self.schema_fingerprint)
+        new = json.loads(fp)
+        if not _shape_extends(base, new):
+            raise DataValidationError(
+                "%s: schema_policy 'compatible' forbids this schema "
+                "change (fields may only be added)" % where)
 
     def note_event(self, event_id):
         """Register one consumed input record; return True if duplicated.
@@ -525,6 +588,13 @@ class SourceState:
             doc["late_policy"] = self.late_policy
             doc["max_event_time"] = self.max_event_time
             doc["watermark"] = self.watermark()
+        if self.schema_policy == "compatible":
+            doc["schema_policy"] = self.schema_policy
+            # The compatibility baseline is the shape of the last accepted
+            # output; it is stored alongside (and must agree with) the
+            # schema fingerprint so a corrupt or foreign checkpoint is
+            # detected on replay.
+            doc["schema_baseline"] = self.schema_fingerprint
         return doc
 
     @classmethod
@@ -579,7 +649,57 @@ class SourceState:
         state.schema_fingerprint = fp
         state.window = state._restore_window(spec, raw)
         state._restore_watermark(spec, raw)
+        state._restore_schema_policy(spec, raw)
         return state
+
+    def _restore_schema_policy(self, spec, raw):
+        """Validate the persisted compatibility baseline, if configured."""
+        configured = spec.get("schema_policy")
+        has_state = "schema_policy" in raw or "schema_baseline" in raw
+        if configured is None:
+            if has_state:
+                raise CheckpointError(
+                    "checkpoint for source %r carries schema policy state "
+                    "but the source configures no schema_policy"
+                    % spec["id"]
+                )
+            return
+        for key in ("schema_policy", "schema_baseline"):
+            if key not in raw:
+                raise CheckpointError(
+                    "checkpoint for source %r is missing the schema "
+                    "policy state %r" % (spec["id"], key)
+                )
+        if raw["schema_policy"] != configured:
+            raise CheckpointError(
+                "checkpoint schema_policy for source %r differs from the "
+                "configuration" % spec["id"]
+            )
+        baseline = raw["schema_baseline"]
+        if baseline is not None and not isinstance(baseline, str):
+            raise CheckpointError(
+                "checkpoint schema_baseline for source %r is invalid"
+                % spec["id"]
+            )
+        # The baseline is the shape of the last accepted output, so it
+        # must agree with the recorded fingerprint; a source with no
+        # output yet has no baseline and version 0, and a source that has
+        # consumed no records cannot have emitted anything.
+        if baseline != self.schema_fingerprint:
+            raise CheckpointError(
+                "checkpoint schema_baseline for source %r contradicts "
+                "its schema_fingerprint" % spec["id"]
+            )
+        if (baseline is None) != (self.schema_version == 0):
+            raise CheckpointError(
+                "checkpoint schema_baseline for source %r is inconsistent "
+                "with its schema_version" % spec["id"]
+            )
+        if self.records == 0 and baseline is not None:
+            raise CheckpointError(
+                "checkpoint schema_baseline for source %r is inconsistent "
+                "with its record count" % spec["id"]
+            )
 
     def _restore_watermark(self, spec, raw):
         """Validate and rebuild the watermark state from checkpoint data."""
@@ -702,6 +822,10 @@ class Checkpoint:
         self.sink_offset = sink_offset
 
     def to_json(self):
+        uses_policy = any(
+            spec.get("schema_policy") == "compatible"
+            for spec in self.config.sources
+        )
         uses_watermark = any(
             spec.get("event_time") is not None
             for spec in self.config.sources
@@ -710,7 +834,9 @@ class Checkpoint:
             spec.get("dedup_window") is not None
             for spec in self.config.sources
         )
-        if uses_watermark:
+        if uses_policy:
+            version = CHECKPOINT_VERSION_SCHEMA_POLICY
+        elif uses_watermark:
             version = CHECKPOINT_VERSION_WATERMARK
         elif uses_dedup:
             version = CHECKPOINT_VERSION_DEDUP
@@ -772,9 +898,10 @@ def load_checkpoint(path, config):
         raise CheckpointError("checkpoint %s is corrupt" % path)
     version = doc.get("version")
     if version not in (CHECKPOINT_VERSION, CHECKPOINT_VERSION_DEDUP,
-                       CHECKPOINT_VERSION_WATERMARK):
+                       CHECKPOINT_VERSION_WATERMARK,
+                       CHECKPOINT_VERSION_SCHEMA_POLICY):
         raise CheckpointError("checkpoint version mismatch (expected %d, got %r)"
-                              % (CHECKPOINT_VERSION_WATERMARK, version))
+                              % (CHECKPOINT_VERSION_SCHEMA_POLICY, version))
     if doc.get("config_fingerprint") != config.fingerprint():
         raise CheckpointError("checkpoint was written by a different configuration")
     any_dedup = any(
@@ -783,6 +910,21 @@ def load_checkpoint(path, config):
     any_watermark = any(
         spec.get("event_time") is not None for spec in config.sources
     )
+    any_compatible = any(
+        spec.get("schema_policy") == "compatible" for spec in config.sources
+    )
+    # Versions 2-4 predate schema policies, and a version 5 checkpoint must
+    # be backed by at least one compatible-policy source.
+    if version < CHECKPOINT_VERSION_SCHEMA_POLICY and any_compatible:
+        raise CheckpointError(
+            "checkpoint predates schema_policy; cannot recover the "
+            "compatibility baseline"
+        )
+    if version == CHECKPOINT_VERSION_SCHEMA_POLICY and not any_compatible:
+        raise CheckpointError(
+            "checkpoint carries schema policy state but the configuration "
+            "sets no schema_policy"
+        )
     # Versions 2/3 predate watermarks, and a version 4 checkpoint must be
     # backed by at least one watermark-configured source.
     if version < CHECKPOINT_VERSION_WATERMARK and any_watermark:
@@ -1353,7 +1495,13 @@ def _emit_record(spec, state, config, sink, source_id, event_id, payload,
     # schema change.
     state.records += 1
     for data in branches:
-        state.note_schema(schema_fingerprint(data))
+        fp = schema_fingerprint(data)
+        # Under ``schema_policy: compatible`` every actually emitted record
+        # is judged against the source's compatibility baseline, in
+        # emission order; the first incompatible output fails the batch.
+        if state.schema_policy == "compatible":
+            state.check_schema_compatible(fp, where)
+        state.note_schema(fp)
         record = {
             "source_id": source_id,
             "event_id": event_id,

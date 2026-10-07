@@ -12,6 +12,9 @@ A configuration is a YAML mapping with two keys::
         watermark_delay: <finite non-negative number, optional>
         late_policy: drop | error (optional; the three watermark keys
                       must be configured together)
+        schema_policy: allow | compatible (optional; ``allow`` and an
+                       absent key are the default behaviour and stay out
+                       of the configuration fingerprint)
         transforms:           # optional, source-level; run after the
           - op: ...           # shared top-level transforms
     transforms:
@@ -33,13 +36,14 @@ CAST_TYPES = ("string", "integer", "number", "boolean")
 COMPARE_OPS = ("eq", "ne", "lt", "lte", "gt", "gte")
 LATE_POLICIES = ("drop", "error")
 ORDERING_COMPARES = ("lt", "lte", "gt", "gte")
+SCHEMA_POLICIES = ("allow", "compatible")
 SUPPORTED_SOURCE_TYPES = ("jsonl", "csv")
 TRANSFORM_OPS = ("rename", "drop", "set", "cast", "filter", "explode")
 TOP_LEVEL_KEYS = ("sources", "transforms")
 SOURCE_REQUIRED_KEYS = ("id", "type", "path", "batch_size")
 WATERMARK_KEYS = ("event_time", "watermark_delay", "late_policy")
 SOURCE_KEYS = SOURCE_REQUIRED_KEYS + ("dedup_window", "transforms") \
-    + WATERMARK_KEYS
+    + WATERMARK_KEYS + ("schema_policy",)
 
 
 def split_path(path):
@@ -213,6 +217,20 @@ def _validate_source(raw, index, seen_ids):
                 "%s.late_policy accepts only %s, got %r"
                 % (where, ", ".join(LATE_POLICIES), policy)
             )
+    # schema_policy selects the per-source schema evolution strategy. Only
+    # "compatible" enters the spec (and therefore the fingerprint): "allow"
+    # is the default behaviour, so an explicit ``schema_policy: allow``
+    # keeps the fingerprint byte-identical to a configuration without the
+    # key and old checkpoints stay replayable.
+    schema_policy = None
+    if "schema_policy" in raw:
+        schema_policy = raw["schema_policy"]
+        if not isinstance(schema_policy, str) \
+                or schema_policy not in SCHEMA_POLICIES:
+            raise ConfigurationError(
+                "%s.schema_policy accepts only %s, got %r"
+                % (where, ", ".join(SCHEMA_POLICIES), schema_policy)
+            )
     seen_ids.add(sid)
     spec = {
         "id": sid,
@@ -225,6 +243,8 @@ def _validate_source(raw, index, seen_ids):
     if present:
         for key in WATERMARK_KEYS:
             spec[key] = raw[key]
+    if schema_policy == "compatible":
+        spec["schema_policy"] = "compatible"
     spec["transforms"] = transforms
     return spec
 
